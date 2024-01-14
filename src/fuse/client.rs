@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::db::{Db, ItemId, QueryError};
+use crate::db::{Db, GetItemsError, ItemId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,7 +18,7 @@ pub enum ReadDirError {
     #[error("failed to parse path")]
     ParsePath(#[source] ParsePathError),
     #[error("failed to get items")]
-    GetItems(#[source] QueryError),
+    GetItems(#[source] GetItemsError),
     #[error("failed to read db dir")]
     ReadDbDir(#[source] std::io::Error),
 }
