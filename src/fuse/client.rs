@@ -25,7 +25,7 @@ pub enum ParsePathError {
     #[error("failed to check item relationship folder match")]
     Relationship(#[source] QueryError),
     #[error("failed to check if item link match")]
-    Link(#[source] QueryError),
+    Link(#[source] MatchesItemLinkError),
 }
 
 #[derive(Debug, Error)]
@@ -50,6 +50,16 @@ pub enum ReadLinkError {
     ParsePath(#[source] ParsePathError),
     #[error("item is not a link")]
     NotALink,
+}
+
+#[derive(Debug, Error)]
+pub enum MatchesItemLinkError {
+    #[error("failed to match item relationship foler")]
+    MatchItemRelationshipFolder(#[source] QueryError),
+    #[error("file was not a valid utf8 string")]
+    InvalidFileName,
+    #[error("failed to sibling")]
+    FindSibling(#[source] QueryError),
 }
 
 fn categorize_relationships(
@@ -201,22 +211,28 @@ fn matches_item_relationship_folder(
     Ok(Some((ItemId(item_id), relationship.id, side)))
 }
 
-fn matches_item_link(path: &Path, db: &Db) -> Result<Option<ItemId>, QueryError> {
+fn matches_item_link(path: &Path, db: &Db) -> Result<Option<ItemId>, MatchesItemLinkError> {
     let Some(parent) = path.parent() else {
         return Ok(None);
     };
 
-    let Some(relationship_folder) = matches_item_relationship_folder(parent, db)? else {
+    let Some(relationship_folder) = matches_item_relationship_folder(parent, db)
+        .map_err(MatchesItemLinkError::MatchItemRelationshipFolder)?
+    else {
         return Ok(None);
     };
 
-    let sibling_name = path.file_name().unwrap().to_str().unwrap();
+    let sibling_name = path
+        .file_name()
+        .and_then(|x| x.to_str())
+        .ok_or(MatchesItemLinkError::InvalidFileName)?;
     db.get_sibling_id(
         relationship_folder.0,
         relationship_folder.2,
         relationship_folder.1,
         sibling_name,
     )
+    .map_err(MatchesItemLinkError::FindSibling)
 }
 
 #[derive(Debug)]

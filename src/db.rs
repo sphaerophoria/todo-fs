@@ -348,7 +348,10 @@ impl Db {
 
         let query = format!("SELECT them_files.id FROM files us_files {join_str} LEFT JOIN relationships ON item_relationships.relationship_id = relationships.id WHERE us_files.id = ?1 AND them_files.name = ?2 AND relationships.id = ?3");
 
-        let mut statement = self.connection.prepare(&query).unwrap();
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(QueryError::Prepare)?;
         let mut query = statement
             .query_map(
                 rusqlite::params![id.0, sibling_name, relationship_id.0],
@@ -357,12 +360,17 @@ impl Db {
                     Ok(ItemId(id))
                 },
             )
-            .unwrap();
+            .map_err(QueryError::Execute)?;
 
         // Option<Result<..>> -> Result<Option<...>>
-        let first = query.next().transpose().unwrap();
-        let second = query.next().transpose().unwrap();
-
+        let first = query
+            .next()
+            .transpose()
+            .map_err(QueryError::QueryMapFailed)?;
+        let second = query
+            .next()
+            .transpose()
+            .map_err(QueryError::QueryMapFailed)?;
         if second.is_some() {
             panic!("Multiple items matched :(");
         }

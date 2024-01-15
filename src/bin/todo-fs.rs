@@ -47,8 +47,8 @@ impl Args {
 fn main() {
     env_logger::init();
 
-    let args = Args::parse(std::env::args()).unwrap();
-    let db = Db::new(args.db_path).unwrap();
+    let args = Args::parse(std::env::args()).expect("failed to parse arguments");
+    let db = Db::new(args.db_path).expect("failed to initialize db");
 
     todo_fs::fuse::run_fuse_client(db, args.other_args.into_iter());
 }
