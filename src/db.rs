@@ -61,6 +61,8 @@ pub enum OpenDbError {
     CreateRelationshipsTable(#[source] rusqlite::Error),
     #[error("failed to create item relationships table")]
     CreateItemRelationshipsTable(#[source] rusqlite::Error),
+    #[error("failed to enable foreign key checks")]
+    EnableForeignKeys(#[source] rusqlite::Error),
     #[error("failed to commit transactions")]
     CommitTransaction(#[source] rusqlite::Error),
 }
@@ -129,6 +131,12 @@ impl Db {
 
         let sqlite_path = path.join("metadata.db");
         let mut connection = Connection::open(sqlite_path).map_err(OpenDbError::OpenConnection)?;
+
+        // NOTE: cannot enable foreign keys on transaction
+        connection
+            .execute("PRAGMA foreign_keys = ON", ())
+            .map_err(OpenDbError::EnableForeignKeys)?;
+
         let transaction = connection
             .transaction()
             .map_err(OpenDbError::StartTransaction)?;
@@ -168,7 +176,7 @@ impl Db {
         })
     }
 
-    pub fn create_item(&mut self, name: &str) -> Result<(), CreateItemError> {
+    pub fn create_item(&mut self, name: &str) -> Result<ItemId, CreateItemError> {
         let transaction = self
             .connection
             .transaction()
@@ -188,7 +196,7 @@ impl Db {
         transaction
             .commit()
             .map_err(CreateItemError::CommitTransaction)?;
-        Ok(())
+        Ok(ItemId(id))
     }
 
     pub fn add_relationship(
@@ -222,7 +230,7 @@ impl Db {
         Ok(RelationshipId(id))
     }
 
-    pub fn find_relationship(
+    fn find_relationship(
         &mut self,
         from_name: &str,
         to_name: &str,
@@ -305,7 +313,7 @@ impl Db {
             .transaction()
             .map_err(AddItemRelationshipError::StartTransaction)?;
         transaction
-            .execute("INSERT OR IGNORE INTO item_relationships(from_id, to_id, relationship_id) VALUES (?1, ?2, ?3)", [from_id.0, to_id.0, relationship_id.0])
+            .execute("INSERT INTO item_relationships(from_id, to_id, relationship_id) VALUES (?1, ?2, ?3)", [from_id.0, to_id.0, relationship_id.0])
             .map_err(AddItemRelationshipError::InsertRelationship)?;
 
         transaction
@@ -419,5 +427,322 @@ impl Db {
             })
         }
         Ok(ret)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        temp_dir: TempDir,
+        db: Db,
+    }
+
+    fn create_fixture() -> Fixture {
+        let temp_dir = tempfile::tempdir().expect("failed to create db dir");
+        let db = Db::new(temp_dir.path().into()).expect("failed to create db");
+        Fixture { temp_dir, db }
+    }
+
+    #[test]
+    fn open_empty_db() {
+        create_fixture();
+    }
+
+    #[test]
+    fn open_populated_db() {
+        let fixture = create_fixture();
+        let db = Db::new(fixture.temp_dir.path().into()).expect("failed to create db");
+    }
+
+    #[test]
+    fn create_new_item() {
+        let mut fixture = create_fixture();
+        let id = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+
+        let retrieved_item = fixture.db.get_item_by_id(id).expect("item should be in db");
+
+        assert!(retrieved_item.path.exists());
+        assert!(retrieved_item.path.is_dir());
+        assert_eq!(retrieved_item.id, id);
+        assert!(retrieved_item.relationships.is_empty());
+        assert_eq!(retrieved_item.name, "test");
+    }
+
+    #[test]
+    fn create_new_item_already_exists_on_disk() {
+        let mut fixture = create_fixture();
+
+        std::fs::create_dir_all(fixture.temp_dir.path().join("items/1"))
+            .expect("failed to create conflicting dir");
+
+        match fixture.db.create_item("test") {
+            Err(CreateItemError::ItemExists) => (),
+            _ => panic!("Unexpected response to creating existing item"),
+        };
+    }
+
+    #[test]
+    fn add_relationship_success() {
+        let mut fixture = create_fixture();
+        fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+    }
+
+    #[test]
+    fn add_relationship_already_exists() {
+        let mut fixture = create_fixture();
+        fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let Err(AddRelationshipError::AlreadyExists(_)) =
+            fixture.db.add_relationship("parents", "new_key")
+        else {
+            panic!("expected already exists");
+        };
+
+        let Err(AddRelationshipError::AlreadyExists(_)) =
+            fixture.db.add_relationship("new_key", "parents")
+        else {
+            panic!("expected already exists");
+        };
+
+        let Err(AddRelationshipError::AlreadyExists(_)) =
+            fixture.db.add_relationship("children", "new_key")
+        else {
+            panic!("expected already exists");
+        };
+
+        let Err(AddRelationshipError::AlreadyExists(_)) =
+            fixture.db.add_relationship("new_key", "children")
+        else {
+            panic!("expected already exists");
+        };
+
+        fixture
+            .db
+            .add_relationship("new_key", "new_key_2")
+            .expect("failed to create releationship with new key");
+    }
+
+    #[test]
+    fn get_relationship() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let relationship_id_2 = fixture
+            .db
+            .add_relationship("parents2", "children2")
+            .expect("failed to create relationship");
+
+        let relationship_1 = fixture
+            .db
+            .get_relationship(relationship_id)
+            .expect("failed to get relationship")
+            .expect("relationship does not exist");
+        assert_eq!(relationship_1.from_name, "parents");
+        assert_eq!(relationship_1.to_name, "children");
+    }
+
+    #[test]
+    fn get_all_relationship() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let relationship_id_2 = fixture
+            .db
+            .add_relationship("parents2", "children2")
+            .expect("failed to create relationship");
+
+        use std::collections::HashMap;
+
+        let items: HashMap<String, String> = fixture
+            .db
+            .get_relationships()
+            .expect("failed to get relationships")
+            .into_iter()
+            .map(|item| (item.from_name, item.to_name))
+            .collect();
+
+        assert_eq!(items.get("parents").map(|x| x.as_ref()), Some("children"));
+        assert_eq!(items.get("parents2").map(|x| x.as_ref()), Some("children2"));
+    }
+
+    #[test]
+    fn add_item_relationship() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let retrieved_1 = fixture
+            .db
+            .get_item_by_id(item_1)
+            .expect("failed to retrieve relationship");
+        let retrieved_2 = fixture
+            .db
+            .get_item_by_id(item_2)
+            .expect("failed to retrieve relationship");
+
+        assert_eq!(retrieved_1.relationships.len(), 1);
+        assert_eq!(retrieved_1.relationships[0].id, relationship_id);
+        assert_eq!(retrieved_1.relationships[0].side, RelationshipSide::Source);
+        assert_eq!(retrieved_1.relationships[0].sibling, item_2);
+
+        assert_eq!(retrieved_2.relationships.len(), 1);
+        assert_eq!(retrieved_2.relationships[0].id, relationship_id);
+        assert_eq!(retrieved_2.relationships[0].side, RelationshipSide::Dest);
+        assert_eq!(retrieved_2.relationships[0].sibling, item_1);
+    }
+
+    #[test]
+    fn add_item_relationship_already_exists() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Err(AddItemRelationshipError::InsertRelationship(_)) = fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+        else {
+            panic!("expected insertion error");
+        };
+    }
+
+    #[test]
+    fn item_relationships_from_id_foreign_key() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        let Err(AddItemRelationshipError::InsertRelationship(_)) = fixture
+            .db
+            .add_item_relationship(ItemId(99), item_2, relationship_id)
+        else {
+            panic!("expected insertion error");
+        };
+    }
+
+    #[test]
+    fn item_relationships_to_id_foreign_key() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        let Err(AddItemRelationshipError::InsertRelationship(_)) = fixture
+            .db
+            .add_item_relationship(item_1, ItemId(99), relationship_id)
+        else {
+            panic!("expected insertion error");
+        };
+    }
+
+    #[test]
+    fn item_relationships_relationship_id_foreign_key() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        let Err(AddItemRelationshipError::InsertRelationship(_)) = fixture
+            .db
+            .add_item_relationship(item_1, item_2, RelationshipId(99))
+        else {
+            panic!("expected insertion error");
+        };
+    }
+
+    #[test]
+    fn get_item_by_id_success() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_id = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item = fixture
+            .db
+            .get_item_by_id(item_id)
+            .expect("failed to get item by id");
+    }
+
+    #[test]
+    fn get_item_by_id_missing_id() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        assert!(fixture.db.get_item_by_id(ItemId(99)).is_none());
     }
 }
