@@ -146,7 +146,6 @@ fn main() -> Result<(), MainError> {
 
     let args = Args::parse(std::env::args()).map_err(MainError::ArgParse)?;
     let mut db = Db::new(args.db_path).map_err(MainError::OpenDb)?;
-
     match args.operation {
         Operation::CreateItem { name } => {
             db.create_item(&name).map_err(MainError::CreateItem)?;

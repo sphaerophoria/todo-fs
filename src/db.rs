@@ -330,6 +330,46 @@ impl Db {
         self.item_path.join(id.0.to_string()).canonicalize()
     }
 
+    pub fn get_sibling_id(
+        &self,
+        id: ItemId,
+        side: RelationshipSide,
+        relationship_id: RelationshipId,
+        sibling_name: &str,
+    ) -> Result<Option<ItemId>, QueryError> {
+        let join_str = match side {
+            RelationshipSide::Dest => {
+                "INNER JOIN item_relationships ON us_files.id = item_relationships.to_id LEFT JOIN files them_files ON them_files.id = item_relationships.from_id"
+            }
+            RelationshipSide::Source => {
+                "INNER JOIN item_relationships ON us_files.id = item_relationships.from_id LEFT JOIN files them_files ON them_files.id = item_relationships.to_id"
+            }
+        };
+
+        let query = format!("SELECT them_files.id FROM files us_files {join_str} LEFT JOIN relationships ON item_relationships.relationship_id = relationships.id WHERE us_files.id = ?1 AND them_files.name = ?2 AND relationships.id = ?3");
+
+        let mut statement = self.connection.prepare(&query).unwrap();
+        let mut query = statement
+            .query_map(
+                rusqlite::params![id.0, sibling_name, relationship_id.0],
+                |row| {
+                    let id: i64 = row.get(0)?;
+                    Ok(ItemId(id))
+                },
+            )
+            .unwrap();
+
+        // Option<Result<..>> -> Result<Option<...>>
+        let first = query.next().transpose().unwrap();
+        let second = query.next().transpose().unwrap();
+
+        if second.is_some() {
+            panic!("Multiple items matched :(");
+        }
+
+        Ok(first)
+    }
+
     pub fn get_item_by_id(&self, id: ItemId) -> Option<DbItem> {
         // FIXME: Don't query the whole database for every item lookup idiot
         self.get_items()
@@ -716,6 +756,293 @@ mod test {
             .add_item_relationship(item_1, item_2, RelationshipId(99))
         else {
             panic!("expected insertion error");
+        };
+    }
+
+    #[test]
+    fn lookup_present_item_id_from_dest_sibling() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let item_id = fixture
+            .db
+            .get_sibling_id(item_1, RelationshipSide::Source, relationship_id, "test2")
+            .expect("failed to find item id");
+        assert_eq!(item_id, Some(item_2));
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_dest_sibling_no_sibling_name() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) =
+            fixture
+                .db
+                .get_sibling_id(item_1, RelationshipSide::Source, relationship_id, "invalid")
+        else {
+            panic!("did not expect to find sibling");
+        };
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_dest_sibling_no_relationship() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) = fixture.db.get_sibling_id(
+            item_1,
+            RelationshipSide::Source,
+            RelationshipId(99),
+            "test2",
+        ) else {
+            panic!("did not expect to find sibling");
+        };
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_dest_sibling_no_source_id() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) = fixture.db.get_sibling_id(
+            ItemId(99),
+            RelationshipSide::Source,
+            relationship_id,
+            "test2",
+        ) else {
+            panic!("did not expect to find sibling");
+        };
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_dest_sibling_wrong_side() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) =
+            fixture
+                .db
+                .get_sibling_id(item_1, RelationshipSide::Dest, relationship_id, "test2")
+        else {
+            panic!("did not expect to find sibling");
+        };
+    }
+
+    #[test]
+    fn lookup_present_item_id_from_source_sibling() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        fixture
+            .db
+            .get_sibling_id(item_2, RelationshipSide::Dest, relationship_id, "test")
+            .expect("failed to find sibling");
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_source_sibling_no_sibling_name() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) =
+            fixture
+                .db
+                .get_sibling_id(item_2, RelationshipSide::Dest, relationship_id, "invalid")
+        else {
+            panic!("did not expect to find sibling");
+        };
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_source_sibling_no_relationship() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) =
+            fixture
+                .db
+                .get_sibling_id(item_2, RelationshipSide::Dest, RelationshipId(99), "test")
+        else {
+            panic!("did not expect to find sibling");
+        };
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_source_sibling_no_source_id() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) =
+            fixture
+                .db
+                .get_sibling_id(ItemId(99), RelationshipSide::Dest, relationship_id, "test")
+        else {
+            panic!("did not expect to find sibling");
+        };
+    }
+
+    #[test]
+    fn lookup_missing_item_id_from_source_sibling_wrong_side() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+        let item_1 = fixture
+            .db
+            .create_item("test")
+            .expect("failed to create item");
+        let item_2 = fixture
+            .db
+            .create_item("test2")
+            .expect("failed to create item");
+
+        fixture
+            .db
+            .add_item_relationship(item_1, item_2, relationship_id)
+            .expect("failed to create relationship");
+        let Ok(None) =
+            fixture
+                .db
+                .get_sibling_id(item_2, RelationshipSide::Source, relationship_id, "test")
+        else {
+            panic!("did not expect to find sibling");
         };
     }
 

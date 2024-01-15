@@ -10,6 +10,8 @@ use crate::db::Db;
 
 use client::{DirEntry, FuseClient};
 
+use self::client::Filetype;
+
 mod client;
 mod sys;
 
@@ -92,12 +94,12 @@ unsafe extern "C" fn fuse_client_getattr(path: *const c_char, statbuf: *mut sys:
         return c_call_errno_neg_1!(lstat, rust_to_c_path(p).as_ptr(), statbuf);
     }
 
-    match client.is_dir(rust_path) {
-        Ok(true) => {
+    match client.get_filetype(rust_path) {
+        Ok(Filetype::Dir) => {
             (*statbuf).st_mode = sys::S_IFDIR | 0o755;
         }
-        Ok(false) => {
-            (*statbuf).st_mode = sys::S_IFREG | 0o644;
+        Ok(Filetype::Link) => {
+            (*statbuf).st_mode = sys::S_IFLNK | 0o777;
         }
         Err(e) => {
             log_error_chain!("failed to get attr", e);
@@ -126,9 +128,11 @@ unsafe extern "C" fn fuse_client_readdir(
         }
     };
     for item in it {
+        // FIXME: fill stat buf
         let name = match item {
             DirEntry::Dir(name) => name,
             DirEntry::File(name) => name,
+            DirEntry::Link(name) => name,
         };
         let name =
             CString::new(name.into_encoded_bytes()).expect("rust paths should be valid cstrings");
@@ -286,6 +290,50 @@ unsafe extern "C" fn fuse_client_read(
     ret.try_into().expect("return value not castable to i32")
 }
 
+unsafe extern "C" fn fuse_client_readlink(
+    path: *const ::std::os::raw::c_char,
+    buf: *mut ::std::os::raw::c_char,
+    bufsize: usize,
+) -> ::std::os::raw::c_int {
+    let client = get_client();
+    let rust_path = c_to_rust_path(path);
+    let passthrough_path = match client.get_passthrough_path(rust_path) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("Failed to retrieve passthrough path: {e}");
+            return -1;
+        }
+    };
+
+    if let Some(passthrough_path) = passthrough_path {
+        use sys::readlink;
+        println!("resolved as passthrough path: {passthrough_path:?}");
+        return c_call_errno_neg_1!(
+            readlink,
+            rust_to_c_path(passthrough_path).as_ptr(),
+            buf,
+            bufsize
+        ) as i32;
+    }
+
+    let link = match client.readlink(rust_path) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("failed to read link: {e}");
+            return -1;
+        }
+    };
+
+    println!("Resolved link: {link:?}");
+    let link = link.into_os_string().into_encoded_bytes();
+
+    let copy_size = link.len().min(bufsize - 1);
+    std::ptr::copy(link.as_ptr(), buf as *mut u8, copy_size);
+    *buf.add(copy_size) = 0;
+
+    0
+}
+
 unsafe extern "C" fn fuse_client_flush(
     _path: *const c_char,
     _info: *mut sys::fuse_file_info,
@@ -308,6 +356,7 @@ const fn generate_fuse_ops() -> sys::fuse_operations {
         ops.write = Some(fuse_client_write);
         ops.read = Some(fuse_client_read);
         ops.flush = Some(fuse_client_flush);
+        ops.readlink = Some(fuse_client_readlink);
         ops
     }
 }
