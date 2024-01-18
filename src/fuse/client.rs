@@ -1,7 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -9,6 +10,8 @@ use crate::db::{
     Db, FilterId, GetItemsError, ItemId, ItemRelationship, RelationshipId, RelationshipSide,
 };
 use thiserror::Error;
+
+use super::api::{ClientRequest, ClientResponse, CreateItemResponse};
 
 #[derive(Debug, Error)]
 pub enum CategorizeRelationshipsError {
@@ -68,6 +71,26 @@ pub enum ReadLinkError {
     NotALink,
 }
 
+#[derive(Debug, Error)]
+pub enum WriteError {
+    #[error("failed to parse json request")]
+    ParseJson(#[source] serde_json::Error),
+    #[error("failed to create item")]
+    CreateItem(#[source] crate::db::CreateItemError),
+    #[error("failed to find response handle")]
+    FindResponseHandle,
+    #[error("failed to serialise response")]
+    SerializeResponse(#[source] serde_json::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum ReadError {
+    #[error("failed to find response handle")]
+    FindResponseHandle,
+    #[error("failed to read from output buffer")]
+    Read(#[source] std::io::Error),
+}
+
 fn categorize_relationships(
     relationships: &Vec<ItemRelationship>,
     db: &Db,
@@ -108,11 +131,13 @@ pub enum Filetype {
 #[derive(Debug)]
 enum PathPurpose {
     Root,
+    ToolBins,
     Items,
+    Socket,
     Item(ItemId),
     ItemRelationships(ItemId, RelationshipId, RelationshipSide),
     ItemLink(ItemId),
-    DbPath(PathBuf),
+    PassthroughPath(PathBuf),
     Filter(FilterId),
     Unknown,
 }
@@ -122,14 +147,15 @@ const ITEMS_FOLDER: &str = "/items";
 fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::Error> {
     let ret = match purpose {
         PathPurpose::Root
+        | PathPurpose::ToolBins
         | PathPurpose::Items
         | PathPurpose::Item(_)
         | PathPurpose::Filter(_)
         | PathPurpose::ItemRelationships(_, _, _)
         | PathPurpose::Unknown => Filetype::Dir,
         PathPurpose::ItemLink(_) => Filetype::Link,
-        PathPurpose::DbPath(p) => {
-            println!("{:?}", p);
+        PathPurpose::Socket => Filetype::File,
+        PathPurpose::PassthroughPath(p) => {
             let metadata = p.metadata()?;
             if metadata.is_dir() {
                 Filetype::Dir
@@ -147,11 +173,21 @@ fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::
 #[derive(Debug)]
 pub struct FuseClient {
     pub db: Db,
+    latest_open_id: u64,
+    open_files: HashMap<u64, VecDeque<u8>>,
 }
 
 impl FuseClient {
+    pub fn new(db: Db) -> FuseClient {
+        FuseClient {
+            db,
+            latest_open_id: 0,
+            open_files: HashMap::new(),
+        }
+    }
+
     pub fn get_passthrough_path(&mut self, path: &Path) -> Result<Option<PathBuf>, ParsePathError> {
-        if let PathPurpose::DbPath(p) = self.parse_path(path)? {
+        if let PathPurpose::PassthroughPath(p) = self.parse_path(path)? {
             return Ok(Some(p));
         }
 
@@ -163,6 +199,59 @@ impl FuseClient {
             .map_err(GetFiletypeError::GetFileType)
     }
 
+    pub fn open(&mut self, path: &Path) -> Result<Option<u64>, ParsePathError> {
+        match self.parse_path(path)? {
+            PathPurpose::Socket => (),
+            _ => return Ok(None),
+        };
+
+        self.open_files.insert(self.latest_open_id, VecDeque::new());
+        let id = self.latest_open_id;
+        self.latest_open_id += 1;
+
+        Ok(Some(id))
+    }
+
+    pub fn write(&mut self, id: u64, buf: &[u8]) -> Result<(), WriteError> {
+        let req = serde_json::from_slice::<ClientRequest>(buf).map_err(WriteError::ParseJson)?;
+
+        match req {
+            ClientRequest::CreateItem(create_item_req) => {
+                let item_id = self
+                    .db
+                    .create_item(&create_item_req.name)
+                    .map_err(WriteError::CreateItem)?;
+                let new_item_path = Path::new(ITEMS_FOLDER).join(item_id.0.to_string());
+                let response = CreateItemResponse {
+                    path: new_item_path,
+                };
+
+                let response = ClientResponse::CreateItem(response);
+
+                let response_file = self
+                    .open_files
+                    .get_mut(&id)
+                    .ok_or(WriteError::FindResponseHandle)?;
+                serde_json::to_writer(response_file, &response)
+                    .map_err(WriteError::SerializeResponse)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn read(&mut self, id: u64, buf: &mut [u8]) -> Result<usize, ReadError> {
+        let f = self
+            .open_files
+            .get_mut(&id)
+            .ok_or(ReadError::FindResponseHandle)?;
+        f.read(buf).map_err(ReadError::Read)
+    }
+
+    pub fn release(&mut self, id: u64) {
+        self.open_files.remove(&id);
+    }
+
     fn list_dir_contents(
         &mut self,
         path: &Path,
@@ -172,7 +261,15 @@ impl FuseClient {
             .map_err(|x| ReadDirError::ParsePath(Box::new(x)))?
         {
             PathPurpose::Root => {
-                let items_iter = [(PathPurpose::Items, "items".to_string())].into_iter();
+                let items_iter = [
+                    (PathPurpose::Items, "items".to_string()),
+                    (PathPurpose::ToolBins, "bin".to_string()),
+                    (
+                        PathPurpose::Socket,
+                        crate::fuse::api::API_HANDLE_PATH[1..].to_string(),
+                    ),
+                ]
+                .into_iter();
 
                 let filters_iter = self
                     .db
@@ -197,7 +294,7 @@ impl FuseClient {
                     .ok_or(ReadDirError::ItemIdNotInDatabase)?;
                 let relationships = categorize_relationships(&item.relationships, &self.db)
                     .map_err(ReadDirError::CategorizeRelationships)?;
-                let db_path = self
+                let passthrough_path = self
                     .db
                     .content_folder_for_id(id)
                     .map_err(ReadDirError::GetContentFolder)?;
@@ -209,7 +306,10 @@ impl FuseClient {
                         )
                     },
                 );
-                Box::new(names.chain([(PathPurpose::DbPath(db_path), "content".to_string())]))
+                Box::new(names.chain([(
+                    PathPurpose::PassthroughPath(passthrough_path),
+                    "content".to_string(),
+                )]))
             }
             PathPurpose::Filter(filter_id) => {
                 let filter = self
@@ -238,7 +338,25 @@ impl FuseClient {
 
                 Box::new(item_it)
             }
-            PathPurpose::ItemLink(_) => return Err(ReadDirError::NotADirectory),
+            PathPurpose::ToolBins => {
+                let my_path = std::env::args().next().expect("no program name");
+                let my_path = PathBuf::from(my_path);
+                let parent_path = my_path
+                    .parent()
+                    .expect("tool bins path should always have a parent");
+
+                let passthrough_path = parent_path.join("create-item");
+                Box::new(
+                    [(
+                        PathPurpose::PassthroughPath(passthrough_path),
+                        "create-item".to_string(),
+                    )]
+                    .into_iter(),
+                )
+            }
+            PathPurpose::Socket | PathPurpose::ItemLink(_) => {
+                return Err(ReadDirError::NotADirectory)
+            }
             PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
                 let item = self
                     .db
@@ -270,12 +388,12 @@ impl FuseClient {
 
                 Box::new(it)
             }
-            PathPurpose::DbPath(p) => {
+            PathPurpose::PassthroughPath(p) => {
                 let it = fs::read_dir(p).map_err(ReadDirError::ReadDbDir)?.map(
                     |item| -> Result<(PathPurpose, String), String> {
                         let item = item.map_err(|e| e.to_string())?;
                         Ok((
-                            PathPurpose::DbPath(item.path()),
+                            PathPurpose::PassthroughPath(item.path()),
                             item.file_name()
                                 .to_str()
                                 .ok_or_else(|| "failed to turn file name into string".to_string())?

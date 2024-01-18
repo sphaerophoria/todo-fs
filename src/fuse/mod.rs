@@ -12,6 +12,7 @@ use client::{DirEntry, FuseClient};
 
 use self::client::Filetype;
 
+pub mod api;
 mod client;
 mod sys;
 
@@ -28,7 +29,6 @@ macro_rules! unwrap_or_return {
         }
     };
 }
-
 macro_rules! c_call_errno_neg_1 {
     ($fn:ident $(, $args:expr)*) => {
         {
@@ -90,8 +90,8 @@ unsafe extern "C" fn fuse_client_getattr(path: *const c_char, statbuf: *mut sys:
 
     if let Some(p) = passthrough_path {
         use sys::lstat;
-        println!("found passthrough path: {:?}", p);
-        return c_call_errno_neg_1!(lstat, rust_to_c_path(p).as_ptr(), statbuf);
+        let ret = c_call_errno_neg_1!(lstat, rust_to_c_path(p).as_ptr(), statbuf);
+        return ret;
     }
 
     match client.get_filetype(rust_path) {
@@ -102,7 +102,7 @@ unsafe extern "C" fn fuse_client_getattr(path: *const c_char, statbuf: *mut sys:
             (*statbuf).st_mode = sys::S_IFLNK | 0o777;
         }
         Ok(Filetype::File) => {
-            (*statbuf).st_mode = sys::S_IFREG | 0o644;
+            (*statbuf).st_mode = sys::S_IFREG | 0o666;
         }
         Err(e) => {
             log_error_chain!("failed to get attr", e);
@@ -160,8 +160,21 @@ unsafe extern "C" fn fuse_client_open(
         return 0;
     }
 
-    warn!("Unimplmeented open for {:?}", rust_path);
-    -1
+    match client.open(rust_path) {
+        Ok(Some(id)) => {
+            (*info).fh = id;
+            (*info).set_direct_io(1);
+            0
+        }
+        Ok(None) => {
+            log::error!("Unhandled open for {rust_path:?}");
+            -1
+        }
+        Err(e) => {
+            log::error!("Failed to open {rust_path:?}: {e}");
+            -1
+        }
+    }
 }
 
 unsafe extern "C" fn fuse_client_create(
@@ -227,35 +240,44 @@ unsafe extern "C" fn fuse_client_write(
 ) -> ::std::os::raw::c_int {
     let client = get_client();
     let rust_path = c_to_rust_path(path);
-    let rust_path = client.get_passthrough_path(rust_path);
-    let rust_path = unwrap_or_return!(rust_path, "get passthrough path");
-    let Some(rust_path) = rust_path else {
-        return -1;
-    };
+    let passthrough_path = client.get_passthrough_path(rust_path);
 
-    if (*info).fh == 0 {
-        use sys::open;
-        let ret = c_call_errno_neg_1!(
-            open,
-            rust_to_c_path(rust_path).as_ptr(),
-            sys::O_WRONLY as i32
-        );
-        (*info).fh = ret.try_into().expect("file handle cannot cast to u64");
+    match passthrough_path {
+        Ok(Some(passthrough_path)) => {
+            if (*info).fh == 0 {
+                use sys::open;
+                let ret = c_call_errno_neg_1!(
+                    open,
+                    rust_to_c_path(passthrough_path).as_ptr(),
+                    sys::O_WRONLY as i32
+                );
+                (*info).fh = ret.try_into().expect("file handle cannot cast to u64");
+            }
+
+            use sys::pwrite;
+            let ret = c_call_errno_neg_1!(
+                pwrite,
+                (*info)
+                    .fh
+                    .try_into()
+                    .expect("file handle is not a valid i32"),
+                buf as *mut c_void,
+                size,
+                offset
+            );
+
+            ret.try_into().expect("write returned invalid return code")
+        }
+        Ok(None) => {
+            let rust_buf = std::slice::from_raw_parts(buf as *const u8, size);
+            unwrap_or_return!(client.write((*info).fh, rust_buf), "write");
+            size.try_into().expect("failed to cast size to i32")
+        }
+        Err(e) => {
+            log::error!("Failed to resolve write path: {e}");
+            -1
+        }
     }
-
-    use sys::pwrite;
-    let ret = c_call_errno_neg_1!(
-        pwrite,
-        (*info)
-            .fh
-            .try_into()
-            .expect("file handle is not a valid i32"),
-        buf as *mut c_void,
-        size,
-        offset
-    );
-
-    ret.try_into().expect("write returned invalid return code")
 }
 
 unsafe extern "C" fn fuse_client_read(
@@ -267,35 +289,45 @@ unsafe extern "C" fn fuse_client_read(
 ) -> ::std::os::raw::c_int {
     let client = get_client();
     let rust_path = c_to_rust_path(path);
-    let rust_path = client.get_passthrough_path(rust_path);
-    let rust_path = unwrap_or_return!(rust_path, "get passthrough path");
-    let Some(rust_path) = rust_path else {
-        return -1;
-    };
+    let passthrough_path = client.get_passthrough_path(rust_path);
 
-    if (*info).fh == 0 {
-        use sys::open;
-        let ret = c_call_errno_neg_1!(
-            open,
-            rust_to_c_path(rust_path).as_ptr(),
-            sys::O_RDONLY as i32
-        );
-        (*info).fh = ret.try_into().expect("file handle cannot cast to u64");
+    match passthrough_path {
+        Ok(Some(passthrough_path)) => {
+            if (*info).fh == 0 {
+                use sys::open;
+                let ret = c_call_errno_neg_1!(
+                    open,
+                    rust_to_c_path(passthrough_path).as_ptr(),
+                    sys::O_RDONLY as i32
+                );
+                (*info).fh = ret.try_into().expect("file handle cannot cast to u64");
+            }
+
+            use sys::pread;
+            let ret = c_call_errno_neg_1!(
+                pread,
+                (*info)
+                    .fh
+                    .try_into()
+                    .expect("file handle is not a valid i32"),
+                buf as *mut c_void,
+                size,
+                offset
+            );
+
+            ret.try_into().expect("return value not castable to i32")
+        }
+        Ok(None) => {
+            let rust_buf = std::slice::from_raw_parts_mut(buf as *mut u8, size);
+            unwrap_or_return!(client.read((*info).fh, rust_buf), "read")
+                .try_into()
+                .expect("failed to cast usize to i32")
+        }
+        Err(e) => {
+            log::error!("Failed to resolve read path: {e}");
+            -1
+        }
     }
-
-    use sys::pread;
-    let ret = c_call_errno_neg_1!(
-        pread,
-        (*info)
-            .fh
-            .try_into()
-            .expect("file handle is not a valid i32"),
-        buf as *mut c_void,
-        size,
-        offset
-    );
-
-    ret.try_into().expect("return value not castable to i32")
 }
 
 unsafe extern "C" fn fuse_client_readlink(
@@ -350,6 +382,30 @@ unsafe extern "C" fn fuse_client_flush(
     0
 }
 
+unsafe extern "C" fn fuse_client_release(
+    path: *const c_char,
+    info: *mut sys::fuse_file_info,
+) -> c_int {
+    let client = get_client();
+    let rust_path = c_to_rust_path(path);
+    let passthrough_path = client.get_passthrough_path(rust_path);
+
+    match passthrough_path {
+        Ok(Some(_)) => {
+            use sys::close;
+            c_call_errno_neg_1!(close, (*info).fh as i32)
+        }
+        Ok(None) => {
+            client.release((*info).fh);
+            0
+        }
+        Err(e) => {
+            log::error!("Failed to retrieve passthrough path: {e}");
+            -1
+        }
+    }
+}
+
 const fn generate_fuse_ops() -> sys::fuse_operations {
     unsafe {
         let mut ops: sys::fuse_operations = MaybeUninit::zeroed().assume_init();
@@ -365,12 +421,13 @@ const fn generate_fuse_ops() -> sys::fuse_operations {
         ops.read = Some(fuse_client_read);
         ops.flush = Some(fuse_client_flush);
         ops.readlink = Some(fuse_client_readlink);
+        ops.release = Some(fuse_client_release);
         ops
     }
 }
 
 pub fn run_fuse_client(db: Db, args: impl Iterator<Item = String>) {
-    let mut client = FuseClient { db };
+    let mut client = FuseClient::new(db);
     let args: Vec<CString> = args
         .map(|s| CString::new(s).expect("input args not valid c strings"))
         .collect();
