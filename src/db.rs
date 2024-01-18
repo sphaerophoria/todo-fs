@@ -19,6 +19,28 @@ pub enum RelationshipSide {
     Dest,
 }
 
+#[derive(Debug, Error)]
+#[error("failed to parse relationship side")]
+pub struct ParseRelationshipSideError;
+
+impl RelationshipSide {
+    fn from_i64(num: i64) -> Result<RelationshipSide, ParseRelationshipSideError> {
+        let num = match num {
+            0 => RelationshipSide::Source,
+            1 => RelationshipSide::Dest,
+            _ => return Err(ParseRelationshipSideError),
+        };
+        Ok(num)
+    }
+
+    fn as_i64(&self) -> i64 {
+        match self {
+            RelationshipSide::Source => 0,
+            RelationshipSide::Dest => 1,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Relationship {
     pub from_name: String,
@@ -65,6 +87,10 @@ pub enum OpenDbError {
     EnableForeignKeys(#[source] rusqlite::Error),
     #[error("failed to commit transactions")]
     CommitTransaction(#[source] rusqlite::Error),
+    #[error("failed to create filters table")]
+    CreateFiltersTable(#[source] rusqlite::Error),
+    #[error("failed to create no relationships filters table")]
+    CreateNoRelationshipsFilterTable(#[source] rusqlite::Error),
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +118,18 @@ pub enum AddItemRelationshipError {
 }
 
 #[derive(Debug, Error)]
+pub enum AddFilterError {
+    #[error("failed to start transaction")]
+    StartTransaction(#[source] rusqlite::Error),
+    #[error("failed to insert filter")]
+    InsertFilter(#[source] rusqlite::Error),
+    #[error("failed to insert rule")]
+    InsertRule(#[source] rusqlite::Error),
+    #[error("failed to commit transaction")]
+    CommitTransaction(#[source] rusqlite::Error),
+}
+
+#[derive(Debug, Error)]
 pub enum QueryError {
     #[error("failed to prepare query")]
     Prepare(#[source] rusqlite::Error),
@@ -109,10 +147,37 @@ pub enum GetItemsError {
     GetRelationships(#[source] QueryError),
 }
 
+#[derive(Debug, Error)]
+pub enum GetFiltersError {
+    #[error("failed to start transaction")]
+    StartTransaction(#[source] rusqlite::Error),
+    #[error("failed to query filters")]
+    QueryFilters(#[source] QueryError),
+    #[error("failed to query rules")]
+    QueryRules(#[source] QueryError),
+    #[error("invalid relationship side")]
+    InvalidRelationshipSide(#[source] ParseRelationshipSideError),
+}
+
 #[derive(Debug)]
 pub struct Db {
     item_path: PathBuf,
     connection: Connection,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum ItemFilterRule {
+    NoRelationship(RelationshipSide, RelationshipId),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct FilterId(i64);
+
+#[derive(Debug)]
+pub struct Filter {
+    pub id: FilterId,
+    pub name: String,
+    pub rules: Vec<ItemFilterRule>,
 }
 
 #[derive(Debug)]
@@ -154,6 +219,23 @@ impl Db {
                 (),
             )
             .map_err(OpenDbError::CreateRelationshipsTable)?;
+
+        transaction
+            .execute(
+                "CREATE TABLE IF NOT EXISTS filters(id INTEGER PRIMARY KEY, name TEXT_NOT_NULL)",
+                (),
+            )
+            .map_err(OpenDbError::CreateFiltersTable)?;
+
+        transaction
+            .execute(
+                "CREATE TABLE IF NOT EXISTS no_relationship_filters(filter_id INTEGER, side INTEGER, relationship_id INTEGER,
+                FOREIGN KEY(filter_id) REFERENCES filters(id),
+                FOREIGN KEY(relationship_id) REFERENCES relationships(id),
+                UNIQUE(filter_id, side, relationship_id))",
+                (),
+            )
+            .map_err(OpenDbError::CreateNoRelationshipsFilterTable)?;
 
         transaction
             .execute(
@@ -326,6 +408,143 @@ impl Db {
         &self.item_path
     }
 
+    pub fn add_filter(
+        &mut self,
+        name: &str,
+        filters: &[ItemFilterRule],
+    ) -> Result<(), AddFilterError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(AddFilterError::StartTransaction)?;
+
+        transaction
+            .execute("INSERT INTO filters(name) VALUES (?1)", [name])
+            .map_err(AddFilterError::InsertFilter)?;
+
+        let filter_id = transaction.last_insert_rowid();
+
+        for filter in filters {
+            match filter {
+                ItemFilterRule::NoRelationship(side, relationship_id) => {
+                    transaction.execute("INSERT INTO no_relationship_filters(filter_id, side, relationship_id) VALUES (?1, ?2, ?3)", [filter_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
+                }
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(AddFilterError::CommitTransaction)?;
+
+        Ok(())
+    }
+
+    pub fn get_filters(&mut self) -> Result<Vec<Filter>, GetFiltersError> {
+        let mut transaction = self
+            .connection
+            .transaction()
+            .map_err(GetFiltersError::StartTransaction)?;
+
+        let mut statement = transaction
+            .prepare("SELECT id, name FROM filters")
+            .map_err(QueryError::Prepare)
+            .map_err(GetFiltersError::QueryFilters)?;
+
+        let ret: Result<Vec<Filter>, QueryError> = statement
+            .query_map((), |row| {
+                let id: i64 = row.get(0)?;
+                let name: String = row.get(1)?;
+
+                Ok(Filter {
+                    id: FilterId(id),
+                    name,
+                    rules: Vec::new(),
+                })
+            })
+            .map_err(QueryError::Execute)
+            .map_err(GetFiltersError::QueryFilters)?
+            .map(|x| x.map_err(QueryError::QueryMapFailed))
+            .collect();
+
+        let mut ret = ret.map_err(GetFiltersError::QueryFilters)?;
+
+        for item in &mut ret {
+            let mut statement = transaction.prepare("SELECT side, relationship_id FROM no_relationship_filters WHERE filter_id = ?1").map_err(QueryError::Prepare)
+                .map_err(GetFiltersError::QueryRules)?;
+
+            let mut rules = Vec::new();
+
+            let mut query = statement
+                .query([item.id.0])
+                .map_err(QueryError::Execute)
+                .map_err(GetFiltersError::QueryRules)?;
+
+            while let Some(row) = query
+                .next()
+                .map_err(QueryError::QueryMapFailed)
+                .map_err(GetFiltersError::QueryRules)?
+            {
+                let side: i64 = row
+                    .get(0)
+                    .map_err(QueryError::QueryMapFailed)
+                    .map_err(GetFiltersError::QueryRules)?;
+                let side = RelationshipSide::from_i64(side)
+                    .map_err(GetFiltersError::InvalidRelationshipSide)?;
+
+                let relationship_id: i64 = row
+                    .get(1)
+                    .map_err(QueryError::QueryMapFailed)
+                    .map_err(GetFiltersError::QueryRules)?;
+                let relationship_id = RelationshipId(relationship_id);
+                rules.push(ItemFilterRule::NoRelationship(side, relationship_id));
+            }
+
+            item.rules = rules;
+        }
+
+        Ok(ret)
+    }
+
+    pub fn run_filter(&self, filters: &[ItemFilterRule]) -> Result<Vec<ItemId>, QueryError> {
+        let mut query_string = "SELECT files.id FROM files ".to_string();
+
+        if !filters.is_empty() {
+            query_string += "WHERE ";
+        }
+
+        for filter in filters {
+            match filter {
+                ItemFilterRule::NoRelationship(side, id) => {
+                    let side_filter_str = match side {
+                        RelationshipSide::Dest => "item_relationships.to_id = files.id",
+                        RelationshipSide::Source => "item_relationships.from_id = files.id",
+                    };
+
+                    let id_i64 = id.0;
+
+                    let filter_str = format!("files.id not in (SELECT files.id FROM files JOIN item_relationships ON {side_filter_str} AND relationship_id = {id_i64}) ");
+                    query_string.push_str(&filter_str);
+                }
+            }
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(&query_string)
+            .map_err(QueryError::Prepare)?;
+
+        let ret: Result<Vec<_>, QueryError> = statement
+            .query_map([], |row| {
+                let id: i64 = row.get(0)?;
+                Ok(ItemId(id))
+            })
+            .map_err(QueryError::Execute)?
+            .map(|x| x.map_err(QueryError::QueryMapFailed))
+            .collect();
+
+        ret
+    }
+
     pub fn content_folder_for_id(&self, id: ItemId) -> Result<PathBuf, std::io::Error> {
         self.item_path.join(id.0.to_string()).canonicalize()
     }
@@ -371,6 +590,7 @@ impl Db {
             .next()
             .transpose()
             .map_err(QueryError::QueryMapFailed)?;
+
         if second.is_some() {
             panic!("Multiple items matched :(");
         }
@@ -387,8 +607,6 @@ impl Db {
     }
 
     pub fn get_items(&self) -> Result<Vec<DbItem>, GetItemsError> {
-        // files(id, name)
-        // item_relationships(from_id, to_id, relationship_id)
         let mut statement = self
             .connection
             .prepare("SELECT id, name FROM files")
@@ -1079,5 +1297,35 @@ mod test {
             .add_relationship("parents", "children")
             .expect("failed to create relationship");
         assert!(fixture.db.get_item_by_id(ItemId(99)).is_none());
+    }
+
+    #[test]
+    fn add_filter_to_db() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+
+        fixture
+            .db
+            .add_filter(
+                "my_filter",
+                &[ItemFilterRule::NoRelationship(
+                    RelationshipSide::Dest,
+                    relationship_id,
+                )],
+            )
+            .expect("failed to add filter");
+
+        let filters = fixture.db.get_filters().expect("failed to get filters");
+
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].name, "my_filter");
+        assert_eq!(filters[0].rules.len(), 1);
+        assert_eq!(
+            filters[0].rules[0],
+            ItemFilterRule::NoRelationship(RelationshipSide::Dest, relationship_id)
+        );
     }
 }

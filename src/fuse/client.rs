@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::db::{Db, GetItemsError, ItemId, ItemRelationship, RelationshipId, RelationshipSide};
+use crate::db::{
+    Db, FilterId, GetItemsError, ItemId, ItemRelationship, RelationshipId, RelationshipSide,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -36,6 +38,12 @@ pub enum ReadDirError {
     ItemIdNotInDatabase,
     #[error("failed to categorize relationships")]
     CategorizeRelationships(#[source] CategorizeRelationshipsError),
+    #[error("failed to get filters from db")]
+    GetFilters(#[source] crate::db::GetFiltersError),
+    #[error("failed to find filter for given ID")]
+    FindFilter,
+    #[error("failed to run filter")]
+    RunFilter(#[source] crate::db::QueryError),
     #[error("failed to get content folder for item")]
     GetContentFolder(#[source] std::io::Error),
     #[error("failed to get filetype for path")]
@@ -105,6 +113,7 @@ enum PathPurpose {
     ItemRelationships(ItemId, RelationshipId, RelationshipSide),
     ItemLink(ItemId),
     DbPath(PathBuf),
+    Filter(FilterId),
     Unknown,
 }
 
@@ -115,6 +124,7 @@ fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::
         PathPurpose::Root
         | PathPurpose::Items
         | PathPurpose::Item(_)
+        | PathPurpose::Filter(_)
         | PathPurpose::ItemRelationships(_, _, _)
         | PathPurpose::Unknown => Filetype::Dir,
         PathPurpose::ItemLink(_) => Filetype::Link,
@@ -164,7 +174,14 @@ impl FuseClient {
             PathPurpose::Root => {
                 let items_iter = [(PathPurpose::Items, "items".to_string())].into_iter();
 
-                Box::new(items_iter)
+                let filters_iter = self
+                    .db
+                    .get_filters()
+                    .map_err(ReadDirError::GetFilters)?
+                    .into_iter()
+                    .map(|filter| (PathPurpose::Filter(filter.id), filter.name));
+
+                Box::new(items_iter.chain(filters_iter))
             }
             PathPurpose::Items => Box::new(
                 self.db
@@ -193,6 +210,33 @@ impl FuseClient {
                     },
                 );
                 Box::new(names.chain([(PathPurpose::DbPath(db_path), "content".to_string())]))
+            }
+            PathPurpose::Filter(filter_id) => {
+                let filter = self
+                    .db
+                    .get_filters()
+                    .map_err(ReadDirError::GetFilters)?
+                    .into_iter()
+                    .find(|filter| filter.id == filter_id)
+                    .ok_or(ReadDirError::FindFilter)?;
+
+                let item_ids = self
+                    .db
+                    .run_filter(&filter.rules)
+                    .map_err(ReadDirError::RunFilter)?;
+
+                let item_it = item_ids.into_iter().map(|item_id| {
+                    let name = self
+                        .db
+                        .get_item_by_id(item_id)
+                        .ok_or(ReadDirError::ItemIdNotInDatabase)?
+                        .name;
+                    Ok((PathPurpose::ItemLink(item_id), name))
+                });
+
+                let item_it = item_it.collect::<Result<Vec<_>, _>>()?.into_iter();
+
+                Box::new(item_it)
             }
             PathPurpose::ItemLink(_) => return Err(ReadDirError::NotADirectory),
             PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
