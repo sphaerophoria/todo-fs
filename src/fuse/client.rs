@@ -1,14 +1,11 @@
 use std::{
-    collections::HashMap,
-    ffi::{OsStr, OsString},
+    collections::HashSet,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
 
-use crate::db::{
-    Db, GetItemsError, ItemId, ItemRelationship, QueryError, RelationshipId, RelationshipSide,
-};
-
+use crate::db::{Db, GetItemsError, ItemId, ItemRelationship, RelationshipId, RelationshipSide};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,18 +18,16 @@ pub enum CategorizeRelationshipsError {
 
 #[derive(Debug, Error)]
 pub enum ParsePathError {
-    #[error("failed to check item folder match")]
-    Folder(#[source] std::io::Error),
-    #[error("failed to check item relationship folder match")]
-    Relationship(#[source] QueryError),
-    #[error("failed to check if item link match")]
-    Link(#[source] MatchesItemLinkError),
+    #[error("failed to list parent dir")]
+    ReadDir(#[from] ReadDirError),
+    #[error("failed to parse path name")]
+    ParsePath,
 }
 
 #[derive(Debug, Error)]
 pub enum ReadDirError {
     #[error("failed to parse path")]
-    ParsePath(#[source] ParsePathError),
+    ParsePath(#[source] Box<ParsePathError>),
     #[error("failed to get items")]
     GetItems(#[source] GetItemsError),
     #[error("failed to read db dir")]
@@ -41,8 +36,20 @@ pub enum ReadDirError {
     ItemIdNotInDatabase,
     #[error("failed to categorize relationships")]
     CategorizeRelationships(#[source] CategorizeRelationshipsError),
+    #[error("failed to get content folder for item")]
+    GetContentFolder(#[source] std::io::Error),
+    #[error("failed to get filetype for path")]
+    GetFiletype(#[source] std::io::Error),
     #[error("read dir called on non directory")]
     NotADirectory,
+}
+
+#[derive(Debug, Error)]
+pub enum GetFiletypeError {
+    #[error("failed to parse path")]
+    ParsePath(#[source] ParsePathError),
+    #[error("failed to get file type for file")]
+    GetFileType(#[source] std::io::Error),
 }
 
 #[derive(Debug, Error)]
@@ -53,21 +60,11 @@ pub enum ReadLinkError {
     NotALink,
 }
 
-#[derive(Debug, Error)]
-pub enum MatchesItemLinkError {
-    #[error("failed to match item relationship foler")]
-    MatchItemRelationshipFolder(#[source] QueryError),
-    #[error("file was not a valid utf8 string")]
-    InvalidFileName,
-    #[error("failed to sibling")]
-    FindSibling(#[source] QueryError),
-}
-
 fn categorize_relationships(
     relationships: &Vec<ItemRelationship>,
     db: &Db,
-) -> Result<HashMap<String, Vec<ItemId>>, CategorizeRelationshipsError> {
-    let mut ret = HashMap::new();
+) -> Result<Vec<(RelationshipId, RelationshipSide, String)>, CategorizeRelationshipsError> {
+    let mut ret = HashSet::new();
 
     for item_relationship in relationships {
         let relationship = db
@@ -82,11 +79,10 @@ fn categorize_relationships(
             RelationshipSide::Source => relationship.to_name,
         };
 
-        let name_items = ret.entry(name).or_insert(Vec::new());
-        name_items.push(item_relationship.sibling);
+        ret.insert((item_relationship.id, item_relationship.side, name));
     }
 
-    Ok(ret)
+    Ok(ret.into_iter().collect())
 }
 
 pub enum DirEntry {
@@ -97,6 +93,7 @@ pub enum DirEntry {
 
 pub enum Filetype {
     Dir,
+    File,
     Link,
 }
 
@@ -113,127 +110,28 @@ enum PathPurpose {
 
 const ITEMS_FOLDER: &str = "/items";
 
-fn has_items_parent<'a>(it: &mut impl Iterator<Item = &'a OsStr>) -> bool {
-    Path::new(ITEMS_FOLDER).iter().eq(it.take(2))
-}
-
-fn matches_item_folder(path: &Path) -> Option<ItemId> {
-    let mut it = path.iter();
-    if !has_items_parent(&mut it) {
-        return None;
-    }
-
-    let id = it.next();
-    let content = it.next();
-
-    if content.is_none() {
-        let id = id.expect("id should exist if content exists");
-        let id = id.to_str()?;
-        let id = id.parse::<i64>().ok()?;
-        return Some(ItemId(id));
-    }
-
-    None
-}
-
-fn matches_item_content_folder(path: &Path, db: &Db) -> Result<Option<PathBuf>, std::io::Error> {
-    let mut it = path.iter();
-    if !has_items_parent(&mut it) {
-        return Ok(None);
-    }
-
-    let id = it.next();
-    let content = it.next();
-    let remaining: PathBuf = it.collect();
-
-    if content == Some(OsStr::new("content")) {
-        let id = id.expect("id should exist if content exists");
-        let Some(id) = id.to_str() else {
-            return Ok(None);
-        };
-        let Some(id) = id.parse::<i64>().ok() else {
-            return Ok(None);
-        };
-        let id = ItemId(id);
-        let full_path = db.content_folder_for_id(id)?.join(remaining);
-        return Ok(Some(full_path));
-    }
-
-    Ok(None)
-}
-
-fn matches_item_relationship_folder(
-    path: &Path,
-    db: &Db,
-) -> Result<Option<(ItemId, RelationshipId, RelationshipSide)>, QueryError> {
-    let mut it = path.iter();
-    if !has_items_parent(&mut it) {
-        return Ok(None);
-    }
-
-    let item_id = it.next();
-    // Relationship folder comes from third, if none it cannot match
-    let Some(third) = it.next() else {
-        return Ok(None);
-    };
-    let fourth = it.next();
-
-    // If we're in a subfolder we are not in the exact folder we want
-    if fourth.is_some() {
-        return Ok(None);
-    }
-
-    let relationships = db.get_relationships()?;
-    let Some(third) = third.to_str() else {
-        return Ok(None);
+fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::Error> {
+    let ret = match purpose {
+        PathPurpose::Root
+        | PathPurpose::Items
+        | PathPurpose::Item(_)
+        | PathPurpose::ItemRelationships(_, _, _)
+        | PathPurpose::Unknown => Filetype::Dir,
+        PathPurpose::ItemLink(_) => Filetype::Link,
+        PathPurpose::DbPath(p) => {
+            println!("{:?}", p);
+            let metadata = p.metadata()?;
+            if metadata.is_dir() {
+                Filetype::Dir
+            } else if metadata.is_symlink() {
+                Filetype::Link
+            } else {
+                Filetype::File
+            }
+        }
     };
 
-    let Some(relationship) = relationships
-        .iter()
-        .find(|relationship| relationship.from_name == third || relationship.to_name == third)
-    else {
-        return Ok(None);
-    };
-
-    let side = if relationship.from_name == third {
-        RelationshipSide::Dest
-    } else {
-        RelationshipSide::Source
-    };
-
-    let item_id = item_id.expect("Item id should always be valid if relationship folder resolved");
-    let Some(item_id) = item_id.to_str() else {
-        return Ok(None);
-    };
-    let Ok(item_id) = item_id.parse() else {
-        return Ok(None);
-    };
-
-    Ok(Some((ItemId(item_id), relationship.id, side)))
-}
-
-fn matches_item_link(path: &Path, db: &Db) -> Result<Option<ItemId>, MatchesItemLinkError> {
-    let Some(parent) = path.parent() else {
-        return Ok(None);
-    };
-
-    let Some(relationship_folder) = matches_item_relationship_folder(parent, db)
-        .map_err(MatchesItemLinkError::MatchItemRelationshipFolder)?
-    else {
-        return Ok(None);
-    };
-
-    let sibling_name = path
-        .file_name()
-        .and_then(|x| x.to_str())
-        .ok_or(MatchesItemLinkError::InvalidFileName)?;
-    db.get_sibling_id(
-        relationship_folder.0,
-        relationship_folder.2,
-        relationship_folder.1,
-        sibling_name,
-    )
-    .map_err(MatchesItemLinkError::FindSibling)
+    Ok(ret)
 }
 
 #[derive(Debug)]
@@ -242,54 +140,103 @@ pub struct FuseClient {
 }
 
 impl FuseClient {
-    pub fn get_passthrough_path(&self, path: &Path) -> Result<Option<PathBuf>, std::io::Error> {
-        matches_item_content_folder(path, &self.db)
-    }
-
-    pub fn get_filetype(&self, path: &Path) -> Result<Filetype, ParsePathError> {
-        match self.parse_path(path)? {
-            PathPurpose::Root
-            | PathPurpose::Items
-            | PathPurpose::Item(_)
-            | PathPurpose::ItemRelationships(_, _, _)
-            | PathPurpose::Unknown => Ok(Filetype::Dir),
-            PathPurpose::ItemLink(_) => Ok(Filetype::Link),
-            PathPurpose::DbPath(_) => panic!("Db paths not handled by client"),
+    pub fn get_passthrough_path(&mut self, path: &Path) -> Result<Option<PathBuf>, ParsePathError> {
+        if let PathPurpose::DbPath(p) = self.parse_path(path)? {
+            return Ok(Some(p));
         }
+
+        Ok(None)
     }
 
-    pub fn readdir(
-        &self,
+    pub fn get_filetype(&mut self, path: &Path) -> Result<Filetype, GetFiletypeError> {
+        path_purpose_to_filetype(&self.parse_path(path).map_err(GetFiletypeError::ParsePath)?)
+            .map_err(GetFiletypeError::GetFileType)
+    }
+
+    fn list_dir_contents(
+        &mut self,
         path: &Path,
-    ) -> Result<Box<dyn Iterator<Item = DirEntry> + '_>, ReadDirError> {
-        let ret: Box<dyn Iterator<Item = DirEntry> + '_> = match self
+    ) -> Result<Box<dyn Iterator<Item = (PathPurpose, String)> + '_>, ReadDirError> {
+        let ret: Box<dyn Iterator<Item = (PathPurpose, String)> + '_> = match self
             .parse_path(path)
-            .map_err(ReadDirError::ParsePath)?
+            .map_err(|x| ReadDirError::ParsePath(Box::new(x)))?
         {
             PathPurpose::Root => {
-                let item_folder_name = Path::new(ITEMS_FOLDER)
-                    .file_name()
-                    .expect("Item folder name should be valid")
-                    .to_os_string();
-                Box::new([DirEntry::Dir(item_folder_name)].into_iter())
+                let items_iter = [(PathPurpose::Items, "items".to_string())].into_iter();
+
+                Box::new(items_iter)
             }
             PathPurpose::Items => Box::new(
                 self.db
                     .get_items()
                     .map_err(ReadDirError::GetItems)?
                     .into_iter()
-                    .map(|item| DirEntry::Dir(item.id.0.to_string().into())),
+                    .map(|item| (PathPurpose::Item(item.id), item.id.0.to_string())),
             ),
+            PathPurpose::Item(id) => {
+                let item = self
+                    .db
+                    .get_item_by_id(id)
+                    .ok_or(ReadDirError::ItemIdNotInDatabase)?;
+                let relationships = categorize_relationships(&item.relationships, &self.db)
+                    .map_err(ReadDirError::CategorizeRelationships)?;
+                let db_path = self
+                    .db
+                    .content_folder_for_id(id)
+                    .map_err(ReadDirError::GetContentFolder)?;
+                let names = relationships.into_iter().map(
+                    move |(relationship_id, relationship_side, name)| {
+                        (
+                            PathPurpose::ItemRelationships(id, relationship_id, relationship_side),
+                            name,
+                        )
+                    },
+                );
+                Box::new(names.chain([(PathPurpose::DbPath(db_path), "content".to_string())]))
+            }
+            PathPurpose::ItemLink(_) => return Err(ReadDirError::NotADirectory),
+            PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
+                let item = self
+                    .db
+                    .get_item_by_id(item_id)
+                    .ok_or(ReadDirError::ItemIdNotInDatabase)?;
+
+                let item_relationships =
+                    item.relationships.into_iter().filter(move |relationship| {
+                        relationship.id == relationship_id && relationship.side == relationship_side
+                    });
+
+                let it = item_relationships.map(
+                    |item_relationship| -> Result<(PathPurpose, String), ItemId> {
+                        let sibling = self
+                            .db
+                            .get_item_by_id(item_relationship.sibling)
+                            .ok_or(item_relationship.sibling)?;
+                        Ok((PathPurpose::ItemLink(sibling.id), sibling.name))
+                    },
+                );
+
+                let it = it.filter_map(|item| match item {
+                    Ok(v) => Some(v),
+                    Err(id) => {
+                        log::error!("item {} not present in db", id.0);
+                        None
+                    }
+                });
+
+                Box::new(it)
+            }
             PathPurpose::DbPath(p) => {
                 let it = fs::read_dir(p).map_err(ReadDirError::ReadDbDir)?.map(
-                    |item| -> Result<DirEntry, std::io::Error> {
-                        let item = item?;
-                        let ft = item.file_type()?;
-                        if ft.is_dir() {
-                            Ok(DirEntry::Dir(item.file_name()))
-                        } else {
-                            Ok(DirEntry::File(item.file_name()))
-                        }
+                    |item| -> Result<(PathPurpose, String), String> {
+                        let item = item.map_err(|e| e.to_string())?;
+                        Ok((
+                            PathPurpose::DbPath(item.path()),
+                            item.file_name()
+                                .to_str()
+                                .ok_or_else(|| "failed to turn file name into string".to_string())?
+                                .to_string(),
+                        ))
                     },
                 );
 
@@ -303,59 +250,34 @@ impl FuseClient {
 
                 Box::new(it)
             }
-            PathPurpose::Item(id) => {
-                let item = self
-                    .db
-                    .get_item_by_id(id)
-                    .ok_or(ReadDirError::ItemIdNotInDatabase)?;
-                let relationships = categorize_relationships(&item.relationships, &self.db)
-                    .map_err(ReadDirError::CategorizeRelationships)?;
-                let names = relationships
-                    .into_keys()
-                    .map(|name| DirEntry::Dir(name.into()));
-                Box::new(names.chain([DirEntry::Dir("content".into())]))
-            }
-            PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
-                let item = self
-                    .db
-                    .get_item_by_id(item_id)
-                    .ok_or(ReadDirError::ItemIdNotInDatabase)?;
-                let item_relationships =
-                    item.relationships.into_iter().filter(move |relationship| {
-                        relationship.id == relationship_id && relationship.side == relationship_side
-                    });
-
-                let it = item_relationships.map(|item_relationship| -> Result<DirEntry, ItemId> {
-                    let sibling = self
-                        .db
-                        .get_item_by_id(item_relationship.sibling)
-                        .ok_or(item_relationship.sibling)?;
-                    Ok(DirEntry::Link(sibling.name.into()))
-                });
-
-                let it = it.filter_map(|item| match item {
-                    Ok(v) => Some(v),
-                    Err(id) => {
-                        log::error!("item {} not present in db", id.0);
-                        None
-                    }
-                });
-
-                Box::new(it)
-            }
-            PathPurpose::ItemLink(_) => {
-                return Err(ReadDirError::NotADirectory);
-            }
             PathPurpose::Unknown => {
                 log::warn!("Unhandled path: {path:?}");
-                Box::new([].into_iter())
+                return Err(ReadDirError::NotADirectory);
             }
         };
 
         Ok(ret)
     }
 
-    pub fn readlink(&self, path: &Path) -> Result<PathBuf, ReadLinkError> {
+    pub fn readdir(
+        &mut self,
+        path: &Path,
+    ) -> Result<impl Iterator<Item = DirEntry> + '_, ReadDirError> {
+        let dir_it = self.list_dir_contents(path)?;
+        let dir_it = dir_it.map(|item| {
+            let ret = match path_purpose_to_filetype(&item.0).map_err(ReadDirError::GetFiletype)? {
+                Filetype::Dir => DirEntry::Dir(item.1.into()),
+                Filetype::Link => DirEntry::Link(item.1.into()),
+                Filetype::File => DirEntry::File(item.1.into()),
+            };
+            Ok(ret)
+        });
+
+        let dir_it = dir_it.collect::<Result<Vec<_>, _>>()?.into_iter();
+        Ok(dir_it)
+    }
+
+    pub fn readlink(&mut self, path: &Path) -> Result<PathBuf, ReadLinkError> {
         let item_id = match self.parse_path(path).map_err(ReadLinkError::ParsePath)? {
             PathPurpose::ItemLink(item_id) => item_id,
             _ => return Err(ReadLinkError::NotALink),
@@ -371,31 +293,21 @@ impl FuseClient {
         Ok(output_path)
     }
 
-    fn parse_path(&self, path: &Path) -> Result<PathPurpose, ParsePathError> {
-        let ret = if path == Path::new("/") {
-            PathPurpose::Root
-        } else if path == Path::new(ITEMS_FOLDER) {
-            PathPurpose::Items
-        } else if let Some(db_path) =
-            matches_item_content_folder(path, &self.db).map_err(ParsePathError::Folder)?
-        {
-            PathPurpose::DbPath(db_path)
-        } else if let Some(item_id) = matches_item_folder(path) {
-            PathPurpose::Item(item_id)
-        } else if let Some((item_id, relationship_id, relationship_side)) =
-            matches_item_relationship_folder(path, &self.db)
-                .map_err(ParsePathError::Relationship)?
-        {
-            PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side)
-        } else if let Some(item_id) =
-            matches_item_link(path, &self.db).map_err(ParsePathError::Link)?
-        {
-            PathPurpose::ItemLink(item_id)
-        } else {
-            println!("Unhandled path: {:?}", path);
-            PathPurpose::Unknown
+    fn parse_path(&mut self, path: &Path) -> Result<PathPurpose, ParsePathError> {
+        let Some(parent) = path.parent() else {
+            return Ok(PathPurpose::Root);
         };
 
-        Ok(ret)
+        let Some(name) = path.file_name() else {
+            return Ok(PathPurpose::Unknown);
+        };
+
+        let name = name.to_str().ok_or(ParsePathError::ParsePath)?;
+
+        let Some(item) = self.list_dir_contents(parent)?.find(|item| item.1 == name) else {
+            return Ok(PathPurpose::Unknown);
+        };
+
+        Ok(item.0)
     }
 }

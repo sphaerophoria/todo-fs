@@ -17,6 +17,18 @@ mod sys;
 
 const FUSE_CLIENT_OPERATIONS: sys::fuse_operations = generate_fuse_ops();
 
+macro_rules! unwrap_or_return {
+    ($val:expr, $purpose:literal) => {
+        match $val {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("Failed to {}: {e}", $purpose);
+                return -1;
+            }
+        }
+    };
+}
+
 macro_rules! c_call_errno_neg_1 {
     ($fn:ident $(, $args:expr)*) => {
         {
@@ -27,18 +39,6 @@ macro_rules! c_call_errno_neg_1 {
             ret
         }
     };
-}
-
-macro_rules! resolve_passthrough_path {
-    ($client:ident, $path:ident) => {{
-        match $client.get_passthrough_path(c_to_rust_path($path)) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
-                return -1;
-            }
-            Err(e) => return -e.raw_os_error().expect("Io error should have valid code"),
-        }
-    }};
 }
 
 macro_rules! log_error_chain {
@@ -83,10 +83,10 @@ unsafe extern "C" fn fuse_client_getattr(path: *const c_char, statbuf: *mut sys:
     let client = get_client();
     let rust_path = c_to_rust_path(path);
 
-    let passthrough_path = match client.get_passthrough_path(rust_path) {
-        Ok(v) => v,
-        Err(e) => return -e.raw_os_error().expect("error value should have code"),
-    };
+    let passthrough_path = unwrap_or_return!(
+        client.get_passthrough_path(c_to_rust_path(path)),
+        "get passthrough path"
+    );
 
     if let Some(p) = passthrough_path {
         use sys::lstat;
@@ -100,6 +100,9 @@ unsafe extern "C" fn fuse_client_getattr(path: *const c_char, statbuf: *mut sys:
         }
         Ok(Filetype::Link) => {
             (*statbuf).st_mode = sys::S_IFLNK | 0o777;
+        }
+        Ok(Filetype::File) => {
+            (*statbuf).st_mode = sys::S_IFREG | 0o644;
         }
         Err(e) => {
             log_error_chain!("failed to get attr", e);
@@ -120,13 +123,8 @@ unsafe extern "C" fn fuse_client_readdir(
     let client = get_client();
     let filler = filler.as_mut().expect("fuse provided invalid dir filler");
 
-    let it = match client.readdir(c_to_rust_path(path)) {
-        Ok(v) => v,
-        Err(e) => {
-            log_error_chain!("failed to readdir", e);
-            return -1;
-        }
-    };
+    let it = unwrap_or_return!(client.readdir(c_to_rust_path(path)), "readdir");
+
     for item in it {
         // FIXME: fill stat buf
         let name = match item {
@@ -149,10 +147,10 @@ unsafe extern "C" fn fuse_client_open(
     let client = get_client();
     let rust_path = c_to_rust_path(path);
 
-    let passthrough_path = match client.get_passthrough_path(rust_path) {
-        Ok(v) => v,
-        Err(e) => return -e.raw_os_error().expect("error value should have code"),
-    };
+    let passthrough_path = unwrap_or_return!(
+        client.get_passthrough_path(rust_path),
+        "get passthrough path"
+    );
 
     if let Some(p) = passthrough_path {
         use sys::open;
@@ -174,10 +172,10 @@ unsafe extern "C" fn fuse_client_create(
     let client = get_client();
     let rust_path = c_to_rust_path(path);
 
-    let passthrough_path = match client.get_passthrough_path(rust_path) {
-        Ok(v) => v,
-        Err(e) => return -e.raw_os_error().expect("error value should have code"),
-    };
+    let passthrough_path = unwrap_or_return!(
+        client.get_passthrough_path(rust_path),
+        "get passthrough path"
+    );
 
     if let Some(p) = passthrough_path {
         use sys::open;
@@ -228,7 +226,12 @@ unsafe extern "C" fn fuse_client_write(
     info: *mut sys::fuse_file_info,
 ) -> ::std::os::raw::c_int {
     let client = get_client();
-    let rust_path = resolve_passthrough_path!(client, path);
+    let rust_path = c_to_rust_path(path);
+    let rust_path = client.get_passthrough_path(rust_path);
+    let rust_path = unwrap_or_return!(rust_path, "get passthrough path");
+    let Some(rust_path) = rust_path else {
+        return -1;
+    };
 
     if (*info).fh == 0 {
         use sys::open;
@@ -263,7 +266,12 @@ unsafe extern "C" fn fuse_client_read(
     info: *mut sys::fuse_file_info,
 ) -> ::std::os::raw::c_int {
     let client = get_client();
-    let rust_path = resolve_passthrough_path!(client, path);
+    let rust_path = c_to_rust_path(path);
+    let rust_path = client.get_passthrough_path(rust_path);
+    let rust_path = unwrap_or_return!(rust_path, "get passthrough path");
+    let Some(rust_path) = rust_path else {
+        return -1;
+    };
 
     if (*info).fh == 0 {
         use sys::open;

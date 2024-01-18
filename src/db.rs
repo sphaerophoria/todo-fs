@@ -10,10 +10,10 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ItemId(pub i64);
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Hash, Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RelationshipId(pub i64);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Hash, Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RelationshipSide {
     Source,
     Dest,
