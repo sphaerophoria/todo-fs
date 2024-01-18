@@ -8,6 +8,7 @@ use std::{
 use crate::db::{
     Db, GetItemsError, ItemId, ItemRelationship, QueryError, RelationshipId, RelationshipSide,
 };
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

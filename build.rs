@@ -1,5 +1,4 @@
-use std::env;
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 fn main() {
     // Tell cargo to invalidate the built crate whenever the wrapper changes
