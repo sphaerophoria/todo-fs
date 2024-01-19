@@ -194,6 +194,7 @@ unsafe extern "C" fn fuse_client_create(
         use sys::open;
         let ret = c_call_errno_neg_1!(open, rust_to_c_path(p).as_ptr(), (*info).flags, mode);
         (*info).fh = ret.try_into().expect("file handle cannot cast to u64");
+        return 0;
     }
 
     warn!("mapped_path in create {:?}", rust_path);

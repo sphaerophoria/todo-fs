@@ -254,12 +254,9 @@ impl FuseClient {
 
     fn list_dir_contents(
         &mut self,
-        path: &Path,
+        path: PathPurpose,
     ) -> Result<Box<dyn Iterator<Item = (PathPurpose, String)> + '_>, ReadDirError> {
-        let ret: Box<dyn Iterator<Item = (PathPurpose, String)> + '_> = match self
-            .parse_path(path)
-            .map_err(|x| ReadDirError::ParsePath(Box::new(x)))?
-        {
+        let ret: Box<dyn Iterator<Item = (PathPurpose, String)> + '_> = match path {
             PathPurpose::Root => {
                 let items_iter = [
                     (PathPurpose::Items, "items".to_string()),
@@ -425,7 +422,10 @@ impl FuseClient {
         &mut self,
         path: &Path,
     ) -> Result<impl Iterator<Item = DirEntry> + '_, ReadDirError> {
-        let dir_it = self.list_dir_contents(path)?;
+        let parsed_path = self
+            .parse_path(path)
+            .map_err(|x| ReadDirError::ParsePath(Box::new(x)))?;
+        let dir_it = self.list_dir_contents(parsed_path)?;
         let dir_it = dir_it.map(|item| {
             let ret = match path_purpose_to_filetype(&item.0).map_err(ReadDirError::GetFiletype)? {
                 Filetype::Dir => DirEntry::Dir(item.1.into()),
@@ -466,7 +466,20 @@ impl FuseClient {
 
         let name = name.to_str().ok_or(ParsePathError::ParsePath)?;
 
-        let Some(item) = self.list_dir_contents(parent)?.find(|item| item.1 == name) else {
+        // Special case for content folder. Usually we can just list the contents of a directory,
+        // and compare the input path with the listed contents as a way to check if the path is
+        // valid. In content directories we allow creation of files, and so must return a
+        // passthrough path whether or not the file exists
+        let parsed_parent = self.parse_path(parent)?;
+        if let PathPurpose::PassthroughPath(passthrough_path) = &parsed_parent {
+            let ret = passthrough_path.join(name);
+            return Ok(PathPurpose::PassthroughPath(ret));
+        }
+
+        let Some(item) = self
+            .list_dir_contents(parsed_parent)?
+            .find(|item| item.1 == name)
+        else {
             return Ok(PathPurpose::Unknown);
         };
 
