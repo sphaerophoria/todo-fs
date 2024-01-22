@@ -2,6 +2,7 @@ use std::{
     ffi::{c_char, c_int, c_void, CStr, CString},
     mem::MaybeUninit,
     path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 use log::warn;
@@ -73,14 +74,14 @@ unsafe fn rust_to_c_path(s: PathBuf) -> CString {
         .expect("rust paths should be valid c strings")
 }
 
-unsafe fn get_client() -> &'static mut FuseClient {
+unsafe fn get_client() -> MutexGuard<'static, FuseClient> {
     let context = sys::fuse_get_context();
-    let client = (*context).private_data as *mut FuseClient;
-    &mut *client
+    let client = (*context).private_data as *const Mutex<FuseClient>;
+    (*client).lock().expect("poisoned lock")
 }
 
 unsafe extern "C" fn fuse_client_getattr(path: *const c_char, statbuf: *mut sys::stat) -> c_int {
-    let client = get_client();
+    let mut client = get_client();
     let rust_path = c_to_rust_path(path);
 
     let passthrough_path = unwrap_or_return!(
@@ -120,7 +121,7 @@ unsafe extern "C" fn fuse_client_readdir(
     _offset: sys::off_t,
     _info: *mut sys::fuse_file_info,
 ) -> c_int {
-    let client = get_client();
+    let mut client = get_client();
     let filler = filler.as_mut().expect("fuse provided invalid dir filler");
 
     let it = unwrap_or_return!(client.readdir(c_to_rust_path(path)), "readdir");
@@ -144,7 +145,7 @@ unsafe extern "C" fn fuse_client_open(
     path: *const c_char,
     info: *mut sys::fuse_file_info,
 ) -> c_int {
-    let client = get_client();
+    let mut client = get_client();
     let rust_path = c_to_rust_path(path);
 
     let passthrough_path = unwrap_or_return!(
@@ -182,7 +183,7 @@ unsafe extern "C" fn fuse_client_create(
     mode: sys::mode_t,
     info: *mut sys::fuse_file_info,
 ) -> c_int {
-    let client = get_client();
+    let mut client = get_client();
     let rust_path = c_to_rust_path(path);
 
     let passthrough_path = unwrap_or_return!(
@@ -239,7 +240,7 @@ unsafe extern "C" fn fuse_client_write(
     offset: sys::off_t,
     info: *mut sys::fuse_file_info,
 ) -> ::std::os::raw::c_int {
-    let client = get_client();
+    let mut client = get_client();
     let rust_path = c_to_rust_path(path);
     let passthrough_path = client.get_passthrough_path(rust_path);
 
@@ -288,7 +289,7 @@ unsafe extern "C" fn fuse_client_read(
     offset: sys::off_t,
     info: *mut sys::fuse_file_info,
 ) -> ::std::os::raw::c_int {
-    let client = get_client();
+    let mut client = get_client();
     let rust_path = c_to_rust_path(path);
     let passthrough_path = client.get_passthrough_path(rust_path);
 
@@ -336,7 +337,7 @@ unsafe extern "C" fn fuse_client_readlink(
     buf: *mut ::std::os::raw::c_char,
     bufsize: usize,
 ) -> ::std::os::raw::c_int {
-    let client = get_client();
+    let mut client = get_client();
     let rust_path = c_to_rust_path(path);
     let passthrough_path = match client.get_passthrough_path(rust_path) {
         Ok(v) => v,
@@ -387,7 +388,7 @@ unsafe extern "C" fn fuse_client_release(
     path: *const c_char,
     info: *mut sys::fuse_file_info,
 ) -> c_int {
-    let client = get_client();
+    let mut client = get_client();
     let rust_path = c_to_rust_path(path);
     let passthrough_path = client.get_passthrough_path(rust_path);
 
@@ -428,7 +429,7 @@ const fn generate_fuse_ops() -> sys::fuse_operations {
 }
 
 pub fn run_fuse_client(db: Db, args: impl Iterator<Item = String>) {
-    let mut client = FuseClient::new(db);
+    let mut client = Mutex::new(FuseClient::new(db));
     let args: Vec<CString> = args
         .map(|s| CString::new(s).expect("input args not valid c strings"))
         .collect();
@@ -454,7 +455,7 @@ pub fn run_fuse_client(db: Db, args: impl Iterator<Item = String>) {
             args.argv,
             &FUSE_CLIENT_OPERATIONS,
             std::mem::size_of_val(&FUSE_CLIENT_OPERATIONS),
-            &mut client as *mut FuseClient as *mut c_void,
+            &mut client as *mut Mutex<FuseClient> as *mut c_void,
         );
     }
 }
