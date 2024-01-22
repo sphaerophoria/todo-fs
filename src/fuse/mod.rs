@@ -11,7 +11,7 @@ use crate::db::Db;
 
 use client::{DirEntry, FuseClient};
 
-use self::client::Filetype;
+use self::client::{Filetype, OpenRet};
 
 pub mod api;
 mod client;
@@ -102,8 +102,9 @@ unsafe extern "C" fn fuse_client_getattr(path: *const c_char, statbuf: *mut sys:
         Ok(Filetype::Link) => {
             (*statbuf).st_mode = sys::S_IFLNK | 0o777;
         }
-        Ok(Filetype::File) => {
+        Ok(Filetype::File(size)) => {
             (*statbuf).st_mode = sys::S_IFREG | 0o666;
+            (*statbuf).st_size = size.try_into().expect("file size did not fit in i64");
         }
         Err(e) => {
             log_error_chain!("failed to get attr", e);
@@ -162,12 +163,13 @@ unsafe extern "C" fn fuse_client_open(
     }
 
     match client.open(rust_path) {
-        Ok(Some(id)) => {
+        Ok(OpenRet::Socket(id)) => {
             (*info).fh = id;
             (*info).set_direct_io(1);
             0
         }
-        Ok(None) => {
+        Ok(OpenRet::Noop) => 0,
+        Ok(OpenRet::Unhandled) => {
             log::error!("Unhandled open for {rust_path:?}");
             -1
         }
@@ -321,7 +323,7 @@ unsafe extern "C" fn fuse_client_read(
         }
         Ok(None) => {
             let rust_buf = std::slice::from_raw_parts_mut(buf as *mut u8, size);
-            unwrap_or_return!(client.read((*info).fh, rust_buf), "read")
+            unwrap_or_return!(client.read(rust_path, (*info).fh, rust_buf), "read")
                 .try_into()
                 .expect("failed to cast usize to i32")
         }

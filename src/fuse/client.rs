@@ -89,6 +89,10 @@ pub enum ReadError {
     FindResponseHandle,
     #[error("failed to read from output buffer")]
     Read(#[source] std::io::Error),
+    #[error("unhandled path")]
+    UnhandledPath,
+    #[error("failed to parse path")]
+    ParsePath(#[from] ParsePathError),
 }
 
 fn categorize_relationships(
@@ -124,25 +128,50 @@ pub enum DirEntry {
 
 pub enum Filetype {
     Dir,
-    File,
+    File(usize),
     Link,
+}
+
+pub enum OpenRet {
+    Socket(u64),
+    Noop,
+    Unhandled,
 }
 
 #[derive(Debug)]
 enum PathPurpose {
+    // root directory of entire filesystem
     Root,
+    // directory where we store exectuables for interacting with fs
     ToolBins,
+    // listing of all items by id
     Items,
+    // "socket" file that allows sending/receiving messages out of band to the fuse filesystem
     Socket,
+    // Directory associated with a given itemid
     Item(ItemId),
+    // metadata file that shows id of current item
+    ItemId(ItemId),
+    // Folder showing all items associated with ItemId by relationship RelationshipId
+    // e.g. in a parents <-> children relationship, this is a "parents" or "children" directory
     ItemRelationships(ItemId, RelationshipId, RelationshipSide),
+    // A link to a specific item by id (presented by name)
     ItemLink(ItemId),
+    // a path that is passed through to the real filesystem
     PassthroughPath(PathBuf),
+    // Named filter that shows items filtered in some way
     Filter(FilterId),
+    // Unknown
     Unknown,
 }
 
 const ITEMS_FOLDER: &str = "/items";
+
+fn get_item_id_file_contents(id: &ItemId) -> Vec<u8> {
+    let mut ret = id.0.to_string();
+    ret += "\n";
+    ret.into_bytes()
+}
 
 fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::Error> {
     let ret = match purpose {
@@ -154,7 +183,11 @@ fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::
         | PathPurpose::ItemRelationships(_, _, _)
         | PathPurpose::Unknown => Filetype::Dir,
         PathPurpose::ItemLink(_) => Filetype::Link,
-        PathPurpose::Socket => Filetype::File,
+        PathPurpose::Socket => Filetype::File(0),
+        PathPurpose::ItemId(id) => {
+            let content_length = get_item_id_file_contents(id).len();
+            Filetype::File(content_length)
+        }
         PathPurpose::PassthroughPath(p) => {
             let metadata = p.metadata()?;
             if metadata.is_dir() {
@@ -162,7 +195,7 @@ fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::
             } else if metadata.is_symlink() {
                 Filetype::Link
             } else {
-                Filetype::File
+                Filetype::File(0)
             }
         }
     };
@@ -199,17 +232,20 @@ impl FuseClient {
             .map_err(GetFiletypeError::GetFileType)
     }
 
-    pub fn open(&mut self, path: &Path) -> Result<Option<u64>, ParsePathError> {
+    pub fn open(&mut self, path: &Path) -> Result<OpenRet, ParsePathError> {
         match self.parse_path(path)? {
             PathPurpose::Socket => (),
-            _ => return Ok(None),
+            PathPurpose::ItemId(_) => {
+                return Ok(OpenRet::Noop);
+            }
+            _ => return Ok(OpenRet::Unhandled),
         };
 
         self.open_files.insert(self.latest_open_id, VecDeque::new());
         let id = self.latest_open_id;
         self.latest_open_id += 1;
 
-        Ok(Some(id))
+        Ok(OpenRet::Socket(id))
     }
 
     pub fn write(&mut self, id: u64, buf: &[u8]) -> Result<(), WriteError> {
@@ -240,12 +276,23 @@ impl FuseClient {
         Ok(())
     }
 
-    pub fn read(&mut self, id: u64, buf: &mut [u8]) -> Result<usize, ReadError> {
-        let f = self
-            .open_files
-            .get_mut(&id)
-            .ok_or(ReadError::FindResponseHandle)?;
-        f.read(buf).map_err(ReadError::Read)
+    pub fn read(&mut self, path: &Path, id: u64, buf: &mut [u8]) -> Result<usize, ReadError> {
+        let parsed_path = self.parse_path(path)?;
+        match parsed_path {
+            PathPurpose::Socket => {
+                let f = self
+                    .open_files
+                    .get_mut(&id)
+                    .ok_or(ReadError::FindResponseHandle)?;
+                f.read(buf).map_err(ReadError::Read)
+            }
+            PathPurpose::ItemId(id) => {
+                let content = get_item_id_file_contents(&id);
+                buf[0..content.len()].copy_from_slice(&content);
+                Ok(content.len())
+            }
+            _ => Err(ReadError::UnhandledPath),
+        }
     }
 
     pub fn release(&mut self, id: u64) {
@@ -303,10 +350,14 @@ impl FuseClient {
                         )
                     },
                 );
-                Box::new(names.chain([(
-                    PathPurpose::PassthroughPath(passthrough_path),
-                    "content".to_string(),
-                )]))
+
+                Box::new(names.chain([
+                    (
+                        PathPurpose::PassthroughPath(passthrough_path),
+                        "content".to_string(),
+                    ),
+                    (PathPurpose::ItemId(id), "id".to_string()),
+                ]))
             }
             PathPurpose::Filter(filter_id) => {
                 let filter = self
@@ -351,7 +402,7 @@ impl FuseClient {
                     .into_iter(),
                 )
             }
-            PathPurpose::Socket | PathPurpose::ItemLink(_) => {
+            PathPurpose::Socket | PathPurpose::ItemLink(_) | PathPurpose::ItemId(_) => {
                 return Err(ReadDirError::NotADirectory)
             }
             PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
@@ -430,7 +481,7 @@ impl FuseClient {
             let ret = match path_purpose_to_filetype(&item.0).map_err(ReadDirError::GetFiletype)? {
                 Filetype::Dir => DirEntry::Dir(item.1.into()),
                 Filetype::Link => DirEntry::Link(item.1.into()),
-                Filetype::File => DirEntry::File(item.1.into()),
+                Filetype::File(_) => DirEntry::File(item.1.into()),
             };
             Ok(ret)
         });
