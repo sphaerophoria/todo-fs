@@ -7,7 +7,8 @@ use std::{
 };
 
 use crate::db::{
-    Db, FilterId, GetItemsError, ItemId, ItemRelationship, RelationshipId, RelationshipSide,
+    Db, FilterId, GetItemsError, ItemId, ItemRelationship, QueryError, RelationshipId,
+    RelationshipSide,
 };
 use thiserror::Error;
 
@@ -35,6 +36,8 @@ pub enum ReadDirError {
     ParsePath(#[source] Box<ParsePathError>),
     #[error("failed to get items")]
     GetItems(#[source] GetItemsError),
+    #[error("failed to get relationships")]
+    GetRelationships(#[source] crate::db::QueryError),
     #[error("failed to read db dir")]
     ReadDbDir(#[source] std::io::Error),
     #[error("item id not in db")]
@@ -50,7 +53,7 @@ pub enum ReadDirError {
     #[error("failed to get content folder for item")]
     GetContentFolder(#[source] std::io::Error),
     #[error("failed to get filetype for path")]
-    GetFiletype(#[source] std::io::Error),
+    GetFiletype(#[source] PathPurposeToFiletypeError),
     #[error("read dir called on non directory")]
     NotADirectory,
 }
@@ -60,7 +63,7 @@ pub enum GetFiletypeError {
     #[error("failed to parse path")]
     ParsePath(#[source] ParsePathError),
     #[error("failed to get file type for file")]
-    GetFileType(#[source] std::io::Error),
+    GetFileType(#[source] PathPurposeToFiletypeError),
 }
 
 #[derive(Debug, Error)]
@@ -93,6 +96,20 @@ pub enum ReadError {
     UnhandledPath,
     #[error("failed to parse path")]
     ParsePath(#[from] ParsePathError),
+    #[error("failed to get from_name for relationship")]
+    RelationshipFromName(#[source] QueryError),
+    #[error("failed to get to_name for relationship")]
+    RelationshipToName(#[source] QueryError),
+}
+
+#[derive(Debug, Error)]
+pub enum PathPurposeToFiletypeError {
+    #[error("failed to get metadata for passthrough file")]
+    GetMetadata(#[source] std::io::Error),
+    #[error("failed to get from_name for relationship")]
+    RelationshipFromName(#[source] QueryError),
+    #[error("failed to get to_name for relationship")]
+    RelationshipToName(#[source] QueryError),
 }
 
 fn categorize_relationships(
@@ -146,6 +163,8 @@ enum PathPurpose {
     ToolBins,
     // listing of all items by id
     Items,
+    // listing of all relationships by id
+    Relationships,
     // "socket" file that allows sending/receiving messages out of band to the fuse filesystem
     Socket,
     // Directory associated with a given itemid
@@ -154,6 +173,10 @@ enum PathPurpose {
     ItemId(ItemId),
     // metadata file that shows name of current item
     ItemName(ItemId),
+    // Directory associated with a given relationship
+    Relationship(RelationshipId),
+    RelationshipFromName(RelationshipId),
+    RelationshipToName(RelationshipId),
     // Folder showing all items associated with ItemId by relationship RelationshipId
     // e.g. in a parents <-> children relationship, this is a "parents" or "children" directory
     ItemRelationships(ItemId, RelationshipId, RelationshipSide),
@@ -169,27 +192,53 @@ enum PathPurpose {
 
 const ITEMS_FOLDER: &str = "/items";
 
+fn with_newline_as_vec(mut s: String) -> Vec<u8> {
+    s += "\n";
+    s.into_bytes()
+}
+
 fn get_item_id_file_contents(id: &ItemId) -> Vec<u8> {
-    let mut ret = id.0.to_string();
-    ret += "\n";
-    ret.into_bytes()
+    with_newline_as_vec(id.0.to_string())
 }
 
 fn get_item_name_file_contents(id: &ItemId, db: &Db) -> Vec<u8> {
     let Some(item) = db.get_item_by_id(*id) else {
         return Default::default();
     };
-    let mut ret = item.name;
-    ret += "\n";
-    ret.into_bytes()
+    with_newline_as_vec(item.name)
 }
 
-fn path_purpose_to_filetype(purpose: &PathPurpose, db: &Db) -> Result<Filetype, std::io::Error> {
+fn get_relationship_from_name_file_contents(
+    id: &RelationshipId,
+    db: &Db,
+) -> Result<Vec<u8>, QueryError> {
+    let Some(relationship) = db.get_relationship(*id)? else {
+        return Ok(Default::default());
+    };
+    Ok(with_newline_as_vec(relationship.from_name))
+}
+
+fn get_relationship_to_name_file_contents(
+    id: &RelationshipId,
+    db: &Db,
+) -> Result<Vec<u8>, QueryError> {
+    let Some(relationship) = db.get_relationship(*id)? else {
+        return Ok(Default::default());
+    };
+    Ok(with_newline_as_vec(relationship.to_name))
+}
+
+fn path_purpose_to_filetype(
+    purpose: &PathPurpose,
+    db: &Db,
+) -> Result<Filetype, PathPurposeToFiletypeError> {
     let ret = match purpose {
         PathPurpose::Root
         | PathPurpose::ToolBins
         | PathPurpose::Items
+        | PathPurpose::Relationships
         | PathPurpose::Item(_)
+        | PathPurpose::Relationship(_)
         | PathPurpose::Filter(_)
         | PathPurpose::ItemRelationships(_, _, _)
         | PathPurpose::Unknown => Filetype::Dir,
@@ -203,8 +252,22 @@ fn path_purpose_to_filetype(purpose: &PathPurpose, db: &Db) -> Result<Filetype, 
             let content_length = get_item_name_file_contents(id, db).len();
             Filetype::File(content_length)
         }
+        PathPurpose::RelationshipFromName(id) => {
+            let content_length = get_relationship_from_name_file_contents(id, db)
+                .map_err(PathPurposeToFiletypeError::RelationshipFromName)?
+                .len();
+            Filetype::File(content_length)
+        }
+        PathPurpose::RelationshipToName(id) => {
+            let content_length = get_relationship_to_name_file_contents(id, db)
+                .map_err(PathPurposeToFiletypeError::RelationshipToName)?
+                .len();
+            Filetype::File(content_length)
+        }
         PathPurpose::PassthroughPath(p) => {
-            let metadata = p.metadata()?;
+            let metadata = p
+                .metadata()
+                .map_err(PathPurposeToFiletypeError::GetMetadata)?;
             if metadata.is_dir() {
                 Filetype::Dir
             } else if metadata.is_symlink() {
@@ -253,7 +316,10 @@ impl FuseClient {
     pub fn open(&mut self, path: &Path) -> Result<OpenRet, ParsePathError> {
         match self.parse_path(path)? {
             PathPurpose::Socket => (),
-            PathPurpose::ItemId(_) | PathPurpose::ItemName(_) => {
+            PathPurpose::ItemId(_)
+            | PathPurpose::ItemName(_)
+            | PathPurpose::RelationshipToName(_)
+            | PathPurpose::RelationshipFromName(_) => {
                 return Ok(OpenRet::Noop);
             }
             _ => return Ok(OpenRet::Unhandled),
@@ -314,6 +380,18 @@ impl FuseClient {
                 buf[0..content.len()].copy_from_slice(&content);
                 Ok(content.len())
             }
+            PathPurpose::RelationshipFromName(id) => {
+                let content = get_relationship_from_name_file_contents(&id, &self.db)
+                    .map_err(ReadError::RelationshipFromName)?;
+                buf[0..content.len()].copy_from_slice(&content);
+                Ok(content.len())
+            }
+            PathPurpose::RelationshipToName(id) => {
+                let content = get_relationship_to_name_file_contents(&id, &self.db)
+                    .map_err(ReadError::RelationshipToName)?;
+                buf[0..content.len()].copy_from_slice(&content);
+                Ok(content.len())
+            }
             _ => Err(ReadError::UnhandledPath),
         }
     }
@@ -330,6 +408,7 @@ impl FuseClient {
             PathPurpose::Root => {
                 let items_iter = [
                     (PathPurpose::Items, "items".to_string()),
+                    (PathPurpose::Relationships, "relationships".to_string()),
                     (PathPurpose::ToolBins, "bin".to_string()),
                     (
                         PathPurpose::Socket,
@@ -353,6 +432,28 @@ impl FuseClient {
                     .map_err(ReadDirError::GetItems)?
                     .into_iter()
                     .map(|item| (PathPurpose::Item(item.id), item.id.0.to_string())),
+            ),
+            PathPurpose::Relationships => Box::new(
+                self.db
+                    .get_relationships()
+                    .map_err(ReadDirError::GetRelationships)?
+                    .into_iter()
+                    .map(|relationship| {
+                        (
+                            PathPurpose::Relationship(relationship.id),
+                            relationship.id.0.to_string(),
+                        )
+                    }),
+            ),
+            PathPurpose::Relationship(id) => Box::new(
+                [
+                    (
+                        PathPurpose::RelationshipFromName(id),
+                        "from_name".to_string(),
+                    ),
+                    (PathPurpose::RelationshipToName(id), "to_name".to_string()),
+                ]
+                .into_iter(),
             ),
             PathPurpose::Item(id) => {
                 let item = self
@@ -429,7 +530,9 @@ impl FuseClient {
             PathPurpose::Socket
             | PathPurpose::ItemLink(_)
             | PathPurpose::ItemId(_)
-            | PathPurpose::ItemName(_) => return Err(ReadDirError::NotADirectory),
+            | PathPurpose::ItemName(_)
+            | PathPurpose::RelationshipFromName(_)
+            | PathPurpose::RelationshipToName(_) => return Err(ReadDirError::NotADirectory),
             PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
                 let item = self
                     .db
