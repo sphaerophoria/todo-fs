@@ -80,6 +80,8 @@ pub enum WriteError {
     ParseJson(#[source] serde_json::Error),
     #[error("failed to create item")]
     CreateItem(#[source] crate::db::CreateItemError),
+    #[error("failed to create relationship")]
+    CreateRelationship(#[from] crate::db::AddItemRelationshipError),
     #[error("failed to find response handle")]
     FindResponseHandle,
     #[error("failed to serialise response")]
@@ -355,6 +357,14 @@ impl FuseClient {
                 serde_json::to_writer(response_file, &response)
                     .map_err(WriteError::SerializeResponse)?;
             }
+            ClientRequest::CreateItemRelationship(req) => {
+                println!("Adding item relationship");
+                self.db.add_item_relationship(
+                    ItemId(req.from_id),
+                    ItemId(req.to_id),
+                    RelationshipId(req.relationship_id),
+                )?;
+            }
         }
 
         Ok(())
@@ -518,12 +528,19 @@ impl FuseClient {
                     .parent()
                     .expect("tool bins path should always have a parent");
 
-                let passthrough_path = parent_path.join("create-item");
+                let create_item_path = parent_path.join("create-item");
+                let create_item_relationship_path = parent_path.join("create-item-relationship");
                 Box::new(
-                    [(
-                        PathPurpose::PassthroughPath(passthrough_path),
-                        "create-item".to_string(),
-                    )]
+                    [
+                        (
+                            PathPurpose::PassthroughPath(create_item_path),
+                            "create-item".to_string(),
+                        ),
+                        (
+                            PathPurpose::PassthroughPath(create_item_relationship_path),
+                            "create-item-relationship".to_string(),
+                        ),
+                    ]
                     .into_iter(),
                 )
             }

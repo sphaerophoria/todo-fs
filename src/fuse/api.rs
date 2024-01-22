@@ -24,7 +24,7 @@ fn open_api_handle_for_file() -> Result<File, std::io::Error> {
         .open(socket_path)
 }
 
-pub fn send_client_request(request: &ClientRequest) -> ClientResponse {
+pub fn send_client_request(request: &ClientRequest) -> Option<ClientResponse> {
     let serialized = serde_json::to_vec(&request).expect("failed to serialize request");
 
     let mut api_handle = open_api_handle_for_file().expect("failed to open api handle");
@@ -39,10 +39,15 @@ pub fn send_client_request(request: &ClientRequest) -> ClientResponse {
         .read(&mut response_buf)
         .expect("failed to read response");
 
+    match request {
+        ClientRequest::CreateItemRelationship(_) => return None,
+        ClientRequest::CreateItem(_) => (),
+    }
+
     let response: ClientResponse =
         serde_json::from_slice(&response_buf[0..num_bytes_read]).expect("failed to parse response");
 
-    response
+    Some(response)
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -58,10 +63,19 @@ pub struct CreateItemResponse {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateItemRelationshipRequest {
+    pub relationship_id: i64,
+    pub from_id: i64,
+    pub to_id: i64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "snake_case")]
 pub enum ClientRequest {
     CreateItem(CreateItemRequest),
+    CreateItemRelationship(CreateItemRelationshipRequest),
 }
 
 #[derive(Serialize, Deserialize, Debug)]

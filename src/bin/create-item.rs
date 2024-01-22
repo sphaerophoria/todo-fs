@@ -40,7 +40,9 @@ fn main() {
 
     let request = ClientRequest::CreateItem(CreateItemRequest { name: item_name });
     let response = api::send_client_request(&request);
-    let ClientResponse::CreateItem(response) = response;
+    let Some(ClientResponse::CreateItem(response)) = response else {
+        panic!("Unexpected response");
+    };
 
     println!("{}", response.path.display());
 }
