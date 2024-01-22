@@ -152,6 +152,8 @@ enum PathPurpose {
     Item(ItemId),
     // metadata file that shows id of current item
     ItemId(ItemId),
+    // metadata file that shows name of current item
+    ItemName(ItemId),
     // Folder showing all items associated with ItemId by relationship RelationshipId
     // e.g. in a parents <-> children relationship, this is a "parents" or "children" directory
     ItemRelationships(ItemId, RelationshipId, RelationshipSide),
@@ -173,7 +175,16 @@ fn get_item_id_file_contents(id: &ItemId) -> Vec<u8> {
     ret.into_bytes()
 }
 
-fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::Error> {
+fn get_item_name_file_contents(id: &ItemId, db: &Db) -> Vec<u8> {
+    let Some(item) = db.get_item_by_id(*id) else {
+        return Default::default();
+    };
+    let mut ret = item.name;
+    ret += "\n";
+    ret.into_bytes()
+}
+
+fn path_purpose_to_filetype(purpose: &PathPurpose, db: &Db) -> Result<Filetype, std::io::Error> {
     let ret = match purpose {
         PathPurpose::Root
         | PathPurpose::ToolBins
@@ -186,6 +197,10 @@ fn path_purpose_to_filetype(purpose: &PathPurpose) -> Result<Filetype, std::io::
         PathPurpose::Socket => Filetype::File(0),
         PathPurpose::ItemId(id) => {
             let content_length = get_item_id_file_contents(id).len();
+            Filetype::File(content_length)
+        }
+        PathPurpose::ItemName(id) => {
+            let content_length = get_item_name_file_contents(id, db).len();
             Filetype::File(content_length)
         }
         PathPurpose::PassthroughPath(p) => {
@@ -228,14 +243,17 @@ impl FuseClient {
     }
 
     pub fn get_filetype(&mut self, path: &Path) -> Result<Filetype, GetFiletypeError> {
-        path_purpose_to_filetype(&self.parse_path(path).map_err(GetFiletypeError::ParsePath)?)
-            .map_err(GetFiletypeError::GetFileType)
+        path_purpose_to_filetype(
+            &self.parse_path(path).map_err(GetFiletypeError::ParsePath)?,
+            &self.db,
+        )
+        .map_err(GetFiletypeError::GetFileType)
     }
 
     pub fn open(&mut self, path: &Path) -> Result<OpenRet, ParsePathError> {
         match self.parse_path(path)? {
             PathPurpose::Socket => (),
-            PathPurpose::ItemId(_) => {
+            PathPurpose::ItemId(_) | PathPurpose::ItemName(_) => {
                 return Ok(OpenRet::Noop);
             }
             _ => return Ok(OpenRet::Unhandled),
@@ -288,6 +306,11 @@ impl FuseClient {
             }
             PathPurpose::ItemId(id) => {
                 let content = get_item_id_file_contents(&id);
+                buf[0..content.len()].copy_from_slice(&content);
+                Ok(content.len())
+            }
+            PathPurpose::ItemName(id) => {
+                let content = get_item_name_file_contents(&id, &self.db);
                 buf[0..content.len()].copy_from_slice(&content);
                 Ok(content.len())
             }
@@ -357,6 +380,7 @@ impl FuseClient {
                         "content".to_string(),
                     ),
                     (PathPurpose::ItemId(id), "id".to_string()),
+                    (PathPurpose::ItemName(id), "name".to_string()),
                 ]))
             }
             PathPurpose::Filter(filter_id) => {
@@ -402,9 +426,10 @@ impl FuseClient {
                     .into_iter(),
                 )
             }
-            PathPurpose::Socket | PathPurpose::ItemLink(_) | PathPurpose::ItemId(_) => {
-                return Err(ReadDirError::NotADirectory)
-            }
+            PathPurpose::Socket
+            | PathPurpose::ItemLink(_)
+            | PathPurpose::ItemId(_)
+            | PathPurpose::ItemName(_) => return Err(ReadDirError::NotADirectory),
             PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
                 let item = self
                     .db
@@ -476,9 +501,11 @@ impl FuseClient {
         let parsed_path = self
             .parse_path(path)
             .map_err(|x| ReadDirError::ParsePath(Box::new(x)))?;
-        let dir_it = self.list_dir_contents(parsed_path)?;
-        let dir_it = dir_it.map(|item| {
-            let ret = match path_purpose_to_filetype(&item.0).map_err(ReadDirError::GetFiletype)? {
+        let dir_it = self.list_dir_contents(parsed_path)?.collect::<Vec<_>>();
+        let dir_it = dir_it.into_iter().map(|item| {
+            let ret = match path_purpose_to_filetype(&item.0, &self.db)
+                .map_err(ReadDirError::GetFiletype)?
+            {
                 Filetype::Dir => DirEntry::Dir(item.1.into()),
                 Filetype::Link => DirEntry::Link(item.1.into()),
                 Filetype::File(_) => DirEntry::File(item.1.into()),
