@@ -12,7 +12,7 @@ use crate::db::{
 };
 use thiserror::Error;
 
-use super::api::{ClientRequest, ClientResponse, CreateItemResponse};
+use super::api::{ClientRequest, ClientResponse, CreateItemResponse, CreateRelationshipResponse};
 
 #[derive(Debug, Error)]
 pub enum CategorizeRelationshipsError {
@@ -81,7 +81,9 @@ pub enum WriteError {
     #[error("failed to create item")]
     CreateItem(#[source] crate::db::CreateItemError),
     #[error("failed to create relationship")]
-    CreateRelationship(#[from] crate::db::AddItemRelationshipError),
+    CreateRelationship(#[from] crate::db::AddRelationshipError),
+    #[error("failed to create item relationship")]
+    CreateItemRelationship(#[from] crate::db::AddItemRelationshipError),
     #[error("failed to find response handle")]
     FindResponseHandle,
     #[error("failed to serialise response")]
@@ -368,6 +370,22 @@ impl FuseClient {
                 serde_json::to_writer(response_file, &response)
                     .map_err(WriteError::SerializeResponse)?;
             }
+            ClientRequest::CreateRelationship(req) => {
+                let item_id = self.db.add_relationship(&req.from_name, &req.to_name)?;
+                let new_item_path = Path::new(RELATIONSHIPS_FOLDER).join(item_id.0.to_string());
+
+                let response = CreateRelationshipResponse {
+                    path: new_item_path,
+                };
+                let response = ClientResponse::CreateRelationship(response);
+
+                let response_file = self
+                    .open_files
+                    .get_mut(&id)
+                    .ok_or(WriteError::FindResponseHandle)?;
+                serde_json::to_writer(response_file, &response)
+                    .map_err(WriteError::SerializeResponse)?;
+            }
             ClientRequest::CreateItemRelationship(req) => {
                 println!("Adding item relationship");
                 self.db.add_item_relationship(
@@ -543,26 +561,24 @@ impl FuseClient {
             }
             PathPurpose::ToolBins => {
                 let my_path = std::env::args().next().expect("no program name");
-                let my_path = PathBuf::from(my_path);
+                let my_path = Path::new(&my_path);
                 let parent_path = my_path
                     .parent()
-                    .expect("tool bins path should always have a parent");
+                    .expect("tool bins path should always have a parent")
+                    .to_path_buf();
 
-                let create_item_path = parent_path.join("create-item");
-                let create_item_relationship_path = parent_path.join("create-item-relationship");
-                Box::new(
-                    [
-                        (
-                            PathPurpose::PassthroughPath(create_item_path),
-                            "create-item".to_string(),
-                        ),
-                        (
-                            PathPurpose::PassthroughPath(create_item_relationship_path),
-                            "create-item-relationship".to_string(),
-                        ),
-                    ]
-                    .into_iter(),
-                )
+                let names = [
+                    "create-item",
+                    "create-item-relationship",
+                    "create-relationship",
+                ];
+
+                Box::new(names.into_iter().map(move |name| {
+                    (
+                        PathPurpose::PassthroughPath(parent_path.join(name)),
+                        name.to_string(),
+                    )
+                }))
             }
             PathPurpose::Socket
             | PathPurpose::ItemLink(_)
