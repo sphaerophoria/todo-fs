@@ -422,6 +422,21 @@ unsafe extern "C" fn fuse_client_release(
         }
     }
 }
+unsafe extern "C" fn fuse_client_unlink(path: *const c_char) -> c_int {
+    let mut client = get_client();
+    let passthrough_path = unwrap_or_return!(
+        client.get_passthrough_path(c_to_rust_path(path)),
+        "get passthrough path"
+    );
+    if let Some(p) = passthrough_path {
+        use sys::unlink;
+        c_call_errno_neg_1!(unlink, rust_to_c_path(p).as_ptr())
+    } else {
+        warn!("attempted unlink on non-passthrough path");
+        -1
+    }
+}
+
 unsafe extern "C" fn fuse_client_rename(from: *const c_char, to: *const c_char) -> c_int {
     let mut client = get_client();
     let from_passthrough_path = unwrap_or_return!(
@@ -472,6 +487,7 @@ const fn generate_fuse_ops() -> sys::fuse_operations {
         ops.flush = Some(fuse_client_flush);
         ops.readlink = Some(fuse_client_readlink);
         ops.release = Some(fuse_client_release);
+        ops.unlink = Some(fuse_client_unlink);
         ops.rename = Some(fuse_client_rename);
         ops
     }
