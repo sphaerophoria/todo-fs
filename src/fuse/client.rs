@@ -177,6 +177,7 @@ enum PathPurpose {
     ItemName(ItemId),
     // Directory associated with a given relationship
     Relationship(RelationshipId),
+    RelationshipId(RelationshipId),
     RelationshipFromName(RelationshipId),
     RelationshipToName(RelationshipId),
     // Folder showing all items associated with ItemId by relationship RelationshipId
@@ -193,6 +194,7 @@ enum PathPurpose {
 }
 
 const ITEMS_FOLDER: &str = "/items";
+const RELATIONSHIPS_FOLDER: &str = "/relationships";
 
 fn with_newline_as_vec(mut s: String) -> Vec<u8> {
     s += "\n";
@@ -200,6 +202,10 @@ fn with_newline_as_vec(mut s: String) -> Vec<u8> {
 }
 
 fn get_item_id_file_contents(id: &ItemId) -> Vec<u8> {
+    with_newline_as_vec(id.0.to_string())
+}
+
+fn get_relationship_id_file_contents(id: &RelationshipId) -> Vec<u8> {
     with_newline_as_vec(id.0.to_string())
 }
 
@@ -252,6 +258,10 @@ fn path_purpose_to_filetype(
         }
         PathPurpose::ItemName(id) => {
             let content_length = get_item_name_file_contents(id, db).len();
+            Filetype::File(content_length)
+        }
+        PathPurpose::RelationshipId(id) => {
+            let content_length = get_relationship_id_file_contents(id).len();
             Filetype::File(content_length)
         }
         PathPurpose::RelationshipFromName(id) => {
@@ -320,6 +330,7 @@ impl FuseClient {
             PathPurpose::Socket => (),
             PathPurpose::ItemId(_)
             | PathPurpose::ItemName(_)
+            | PathPurpose::RelationshipId(_)
             | PathPurpose::RelationshipToName(_)
             | PathPurpose::RelationshipFromName(_) => {
                 return Ok(OpenRet::Noop);
@@ -390,6 +401,11 @@ impl FuseClient {
                 buf[0..content.len()].copy_from_slice(&content);
                 Ok(content.len())
             }
+            PathPurpose::RelationshipId(id) => {
+                let content = get_relationship_id_file_contents(&id);
+                buf[0..content.len()].copy_from_slice(&content);
+                Ok(content.len())
+            }
             PathPurpose::RelationshipFromName(id) => {
                 let content = get_relationship_from_name_file_contents(&id, &self.db)
                     .map_err(ReadError::RelationshipFromName)?;
@@ -417,8 +433,11 @@ impl FuseClient {
         let ret: Box<dyn Iterator<Item = (PathPurpose, String)> + '_> = match path {
             PathPurpose::Root => {
                 let items_iter = [
-                    (PathPurpose::Items, "items".to_string()),
-                    (PathPurpose::Relationships, "relationships".to_string()),
+                    (PathPurpose::Items, ITEMS_FOLDER[1..].to_string()),
+                    (
+                        PathPurpose::Relationships,
+                        RELATIONSHIPS_FOLDER[1..].to_string(),
+                    ),
                     (PathPurpose::ToolBins, "bin".to_string()),
                     (
                         PathPurpose::Socket,
@@ -457,6 +476,7 @@ impl FuseClient {
             ),
             PathPurpose::Relationship(id) => Box::new(
                 [
+                    (PathPurpose::RelationshipId(id), "id".to_string()),
                     (
                         PathPurpose::RelationshipFromName(id),
                         "from_name".to_string(),
@@ -548,6 +568,7 @@ impl FuseClient {
             | PathPurpose::ItemLink(_)
             | PathPurpose::ItemId(_)
             | PathPurpose::ItemName(_)
+            | PathPurpose::RelationshipId(_)
             | PathPurpose::RelationshipFromName(_)
             | PathPurpose::RelationshipToName(_) => return Err(ReadDirError::NotADirectory),
             PathPurpose::ItemRelationships(item_id, relationship_id, relationship_side) => {
