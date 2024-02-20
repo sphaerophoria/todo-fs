@@ -93,6 +93,17 @@ pub enum CreateItemError {
 }
 
 #[derive(Debug, Error)]
+pub enum DeleteItemError {
+    #[error("failed to start transaction")]
+    StartTransaction(#[source] rusqlite::Error),
+    #[error("failed to delete item")]
+    DeleteItem(#[source] rusqlite::Error),
+    #[error("failed to delete item relationships")]
+    DeleteItemRelationships(#[source] rusqlite::Error),
+    #[error("failed to commit transaction")]
+    CommitTransaction(#[source] rusqlite::Error),
+}
+#[derive(Debug, Error)]
 pub enum OpenDbError {
     #[error("failed to create directory for content")]
     CreateFilesDir(#[source] std::io::Error),
@@ -231,7 +242,7 @@ impl Db {
 
         transaction
             .execute(
-                "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
                 (),
             )
             .map_err(OpenDbError::CreateFilesTable)?;
@@ -302,6 +313,32 @@ impl Db {
             .commit()
             .map_err(CreateItemError::CommitTransaction)?;
         Ok(ItemId(id))
+    }
+
+    pub fn delete_item(&mut self, id: ItemId) -> Result<(), DeleteItemError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(DeleteItemError::StartTransaction)?;
+
+        transaction
+            .execute(
+                "DELETE FROM item_relationships WHERE from_id = ?1 OR to_id = ?1",
+                [id.0],
+            )
+            .map_err(DeleteItemError::DeleteItemRelationships)?;
+
+        transaction
+            .execute("DELETE FROM files WHERE id = ?1", [id.0])
+            .map_err(DeleteItemError::DeleteItem)?;
+
+        let item_path = self.item_path.join(id.0.to_string());
+        fs::remove_dir_all(item_path);
+
+        transaction
+            .commit()
+            .map_err(DeleteItemError::CommitTransaction)?;
+        Ok(())
     }
 
     pub fn add_relationship(
@@ -1350,5 +1387,58 @@ mod test {
             filters[0].rules[0],
             ItemFilterRule::NoRelationship(RelationshipSide::Dest, relationship_id)
         );
+    }
+
+    #[test]
+    fn delete_item() {
+        let mut fixture = create_fixture();
+        let relationship_id = fixture
+            .db
+            .add_relationship("parents", "children")
+            .expect("failed to create relationship");
+
+        let parent_id = fixture
+            .db
+            .create_item("parent")
+            .expect("failed to create parent");
+        let child_id = fixture
+            .db
+            .create_item("child")
+            .expect("failed to create parent");
+
+        let child_data_path = fixture
+            .temp_dir
+            .path()
+            .join("items")
+            .join(child_id.0.to_string());
+        assert!(child_data_path.exists());
+
+        fixture
+            .db
+            .add_item_relationship(parent_id, child_id, relationship_id)
+            .expect("failed to add item relationship");
+
+        // Pre-deletion, parent should see a relationship with child
+        let parent = fixture
+            .db
+            .get_item_by_id(parent_id)
+            .expect("failed to get parent");
+        assert_eq!(parent.relationships.len(), 1);
+
+        fixture
+            .db
+            .delete_item(child_id)
+            .expect("failed to delete child");
+        // Child should fail to resolve after being deleted
+        assert!(fixture.db.get_item_by_id(child_id).is_none());
+        // Child data should be deleted
+        assert!(!child_data_path.exists());
+
+        // Post-deletion, parent should no longer see a relationship with child
+        let parent = fixture
+            .db
+            .get_item_by_id(parent_id)
+            .expect("failed to get parent");
+        assert_eq!(parent.relationships.len(), 0);
     }
 }

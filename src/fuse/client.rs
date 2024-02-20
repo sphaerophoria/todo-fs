@@ -80,6 +80,8 @@ pub enum WriteError {
     ParseJson(#[source] serde_json::Error),
     #[error("failed to create item")]
     CreateItem(#[source] crate::db::CreateItemError),
+    #[error("failed to delete item")]
+    DeleteItem(#[from] crate::db::DeleteItemError),
     #[error("failed to create relationship")]
     CreateRelationship(#[from] crate::db::AddRelationshipError),
     #[error("failed to create item relationship")]
@@ -372,6 +374,9 @@ impl FuseClient {
                 serde_json::to_writer(response_file, &response)
                     .map_err(WriteError::SerializeResponse)?;
             }
+            ClientRequest::DeleteItem(req) => {
+                self.db.delete_item(ItemId(req.id))?;
+            }
             ClientRequest::CreateRelationship(req) => {
                 let item_id = self.db.add_relationship(&req.from_name, &req.to_name)?;
                 let new_item_path = Path::new(RELATIONSHIPS_FOLDER).join(item_id.0.to_string());
@@ -577,6 +582,7 @@ impl FuseClient {
                     "create-item-relationship",
                     "create-relationship",
                     "create-filter",
+                    "delete-item",
                 ];
 
                 Box::new(names.into_iter().map(move |name| {

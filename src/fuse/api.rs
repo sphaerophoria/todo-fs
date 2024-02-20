@@ -45,7 +45,9 @@ pub fn send_client_request(request: &ClientRequest) -> Option<ClientResponse> {
         .expect("failed to read response");
 
     match request {
-        ClientRequest::CreateItemRelationship(_) | ClientRequest::CreateFilter(_) => return None,
+        ClientRequest::CreateItemRelationship(_)
+        | ClientRequest::CreateFilter(_)
+        | ClientRequest::DeleteItem(_) => return None,
         ClientRequest::CreateItem(_) | ClientRequest::CreateRelationship(_) => (),
     }
 
@@ -59,6 +61,12 @@ pub fn send_client_request(request: &ClientRequest) -> Option<ClientResponse> {
 #[serde(rename_all = "snake_case")]
 pub struct CreateItemRequest {
     pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub struct DeleteItemRequest {
+    pub id: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -155,6 +163,7 @@ pub struct CreateFilterRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ClientRequest {
     CreateItem(CreateItemRequest),
+    DeleteItem(DeleteItemRequest),
     CreateRelationship(CreateRelationshipRequest),
     CreateItemRelationship(CreateItemRelationshipRequest),
     CreateFilter(CreateFilterRequest),
