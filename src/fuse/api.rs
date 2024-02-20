@@ -1,9 +1,14 @@
-use serde::{Deserialize, Serialize};
+use serde::{
+    de::{Expected, Unexpected},
+    Deserialize, Serialize,
+};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::PathBuf,
 };
+
+use crate::db::{ItemFilterRule, RelationshipId};
 
 pub const API_HANDLE_PATH: &str = "/.api_handle";
 
@@ -40,7 +45,7 @@ pub fn send_client_request(request: &ClientRequest) -> Option<ClientResponse> {
         .expect("failed to read response");
 
     match request {
-        ClientRequest::CreateItemRelationship(_) => return None,
+        ClientRequest::CreateItemRelationship(_) | ClientRequest::CreateFilter(_) => return None,
         ClientRequest::CreateItem(_) | ClientRequest::CreateRelationship(_) => (),
     }
 
@@ -84,12 +89,75 @@ pub struct CreateItemRelationshipRequest {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+enum ItemFilterRuleSerializeProxy {
+    NoRelationship { side: String, id: i64 },
+}
+
+impl ItemFilterRuleSerializeProxy {
+    fn new(rule: &ItemFilterRule) -> ItemFilterRuleSerializeProxy {
+        use ItemFilterRule::*;
+        match rule {
+            NoRelationship(side, id) => ItemFilterRuleSerializeProxy::NoRelationship {
+                side: side.to_string(),
+                id: id.0,
+            },
+        }
+    }
+}
+
+impl serde::Serialize for ItemFilterRule {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let proxy = ItemFilterRuleSerializeProxy::new(self);
+        proxy.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ItemFilterRule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let proxy = ItemFilterRuleSerializeProxy::deserialize(deserializer)?;
+        struct ExpectedSize;
+        impl Expected for ExpectedSize {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("expected one of \"source\" or \"dest\"")
+            }
+        }
+        let ret = match proxy {
+            ItemFilterRuleSerializeProxy::NoRelationship { side, id } => {
+                let side = side.parse().map_err(|_| {
+                    serde::de::Error::invalid_value(
+                        Unexpected::Other("invalid side"),
+                        &ExpectedSize,
+                    )
+                })?;
+                ItemFilterRule::NoRelationship(side, RelationshipId(id))
+            }
+        };
+        Ok(ret)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(rename_all = "snake_case")]
+pub struct CreateFilterRequest {
+    pub name: String,
+    pub filters: Vec<ItemFilterRule>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", content = "data")]
 #[serde(rename_all = "snake_case")]
 pub enum ClientRequest {
     CreateItem(CreateItemRequest),
     CreateRelationship(CreateRelationshipRequest),
     CreateItemRelationship(CreateItemRelationshipRequest),
+    CreateFilter(CreateFilterRequest),
 }
 
 #[derive(Serialize, Deserialize, Debug)]

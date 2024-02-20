@@ -84,6 +84,8 @@ pub enum WriteError {
     CreateRelationship(#[from] crate::db::AddRelationshipError),
     #[error("failed to create item relationship")]
     CreateItemRelationship(#[from] crate::db::AddItemRelationshipError),
+    #[error("failed to add filter")]
+    AddFilter(#[from] crate::db::AddFilterError),
     #[error("failed to find response handle")]
     FindResponseHandle,
     #[error("failed to serialise response")]
@@ -386,6 +388,9 @@ impl FuseClient {
                 serde_json::to_writer(response_file, &response)
                     .map_err(WriteError::SerializeResponse)?;
             }
+            ClientRequest::CreateFilter(req) => {
+                self.db.add_filter(&req.name, &req.filters)?;
+            }
             ClientRequest::CreateItemRelationship(req) => {
                 println!("Adding item relationship");
                 self.db.add_item_relationship(
@@ -571,6 +576,7 @@ impl FuseClient {
                     "create-item",
                     "create-item-relationship",
                     "create-relationship",
+                    "create-filter",
                 ];
 
                 Box::new(names.into_iter().map(move |name| {

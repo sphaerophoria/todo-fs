@@ -1,9 +1,11 @@
 #![allow(unused)]
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 use thiserror::Error;
 
@@ -17,6 +19,27 @@ pub struct RelationshipId(pub i64);
 pub enum RelationshipSide {
     Source,
     Dest,
+}
+
+impl fmt::Display for RelationshipSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RelationshipSide::Source => f.write_str("source"),
+            RelationshipSide::Dest => f.write_str("dest"),
+        }
+    }
+}
+
+impl FromStr for RelationshipSide {
+    type Err = ParseRelationshipSideError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "source" => Ok(RelationshipSide::Source),
+            "dest" => Ok(RelationshipSide::Dest),
+            _ => Err(ParseRelationshipSideError),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
