@@ -422,7 +422,40 @@ unsafe extern "C" fn fuse_client_release(
         }
     }
 }
+unsafe extern "C" fn fuse_client_rename(from: *const c_char, to: *const c_char) -> c_int {
+    let mut client = get_client();
+    let from_passthrough_path = unwrap_or_return!(
+        client.get_passthrough_path(c_to_rust_path(from)),
+        "get from passthrough path"
+    );
 
+    let to_passthrough_path = unwrap_or_return!(
+        client.get_passthrough_path(c_to_rust_path(to)),
+        "get from passthrough path"
+    );
+
+    let Some(from_passthrough_path) = from_passthrough_path else {
+        warn!("source path of rename not a passthrough path");
+        return -1;
+    };
+
+    let Some(to_passthrough_path) = to_passthrough_path else {
+        warn!("dest path of rename not a passthrough path");
+        return -1;
+    };
+
+    println!(
+        "Renaming {} -> {}",
+        from_passthrough_path.display(),
+        to_passthrough_path.display()
+    );
+    use sys::rename;
+    c_call_errno_neg_1!(
+        rename,
+        rust_to_c_path(from_passthrough_path).as_ptr(),
+        rust_to_c_path(to_passthrough_path).as_ptr()
+    )
+}
 const fn generate_fuse_ops() -> sys::fuse_operations {
     unsafe {
         let mut ops: sys::fuse_operations = MaybeUninit::zeroed().assume_init();
@@ -439,6 +472,7 @@ const fn generate_fuse_ops() -> sys::fuse_operations {
         ops.flush = Some(fuse_client_flush);
         ops.readlink = Some(fuse_client_readlink);
         ops.release = Some(fuse_client_release);
+        ops.rename = Some(fuse_client_rename);
         ops
     }
 }
