@@ -205,11 +205,24 @@ unsafe extern "C" fn fuse_client_create(
     -1
 }
 unsafe extern "C" fn fuse_client_chmod(
-    _arg1: *const ::std::os::raw::c_char,
-    _arg2: sys::mode_t,
+    path: *const ::std::os::raw::c_char,
+    mode: sys::mode_t,
 ) -> ::std::os::raw::c_int {
-    warn!("unimplemented chmod");
-    0
+    let mut client = get_client();
+    let rust_path = c_to_rust_path(path);
+
+    let passthrough_path = unwrap_or_return!(
+        client.get_passthrough_path(rust_path),
+        "get passthrough path"
+    );
+
+    if let Some(p) = passthrough_path {
+        use sys::chmod;
+        c_call_errno_neg_1!(chmod, rust_to_c_path(p).as_ptr(), mode)
+    } else {
+        warn!("chmod on non-passthrough path");
+        -1
+    }
 }
 unsafe extern "C" fn fuse_client_chown(
     _arg1: *const ::std::os::raw::c_char,
