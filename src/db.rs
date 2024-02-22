@@ -200,18 +200,18 @@ pub struct Db {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum ItemFilterRule {
+pub enum Condition {
     NoRelationship(RelationshipSide, RelationshipId),
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct FilterId(i64);
+pub struct ConditionSetId(i64);
 
 #[derive(Debug)]
-pub struct Filter {
-    pub id: FilterId,
+pub struct ConditionSet {
+    pub id: ConditionSetId,
     pub name: String,
-    pub rules: Vec<ItemFilterRule>,
+    pub rules: Vec<Condition>,
 }
 
 #[derive(Debug)]
@@ -471,7 +471,7 @@ impl Db {
     pub fn add_filter(
         &mut self,
         name: &str,
-        filters: &[ItemFilterRule],
+        conditions: &[Condition],
     ) -> Result<(), AddFilterError> {
         let transaction = self
             .connection
@@ -484,9 +484,9 @@ impl Db {
 
         let filter_id = transaction.last_insert_rowid();
 
-        for filter in filters {
-            match filter {
-                ItemFilterRule::NoRelationship(side, relationship_id) => {
+        for condition in conditions {
+            match condition {
+                Condition::NoRelationship(side, relationship_id) => {
                     transaction.execute("INSERT INTO no_relationship_filters(filter_id, side, relationship_id) VALUES (?1, ?2, ?3)", [filter_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
                 }
             }
@@ -499,7 +499,7 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_filters(&mut self) -> Result<Vec<Filter>, GetFiltersError> {
+    pub fn get_filters(&mut self) -> Result<Vec<ConditionSet>, GetFiltersError> {
         let mut transaction = self
             .connection
             .transaction()
@@ -510,13 +510,13 @@ impl Db {
             .map_err(QueryError::Prepare)
             .map_err(GetFiltersError::QueryFilters)?;
 
-        let ret: Result<Vec<Filter>, QueryError> = statement
+        let ret: Result<Vec<ConditionSet>, QueryError> = statement
             .query_map((), |row| {
                 let id: i64 = row.get(0)?;
                 let name: String = row.get(1)?;
 
-                Ok(Filter {
-                    id: FilterId(id),
+                Ok(ConditionSet {
+                    id: ConditionSetId(id),
                     name,
                     rules: Vec::new(),
                 })
@@ -556,7 +556,7 @@ impl Db {
                     .map_err(QueryError::QueryMapFailed)
                     .map_err(GetFiltersError::QueryRules)?;
                 let relationship_id = RelationshipId(relationship_id);
-                rules.push(ItemFilterRule::NoRelationship(side, relationship_id));
+                rules.push(Condition::NoRelationship(side, relationship_id));
             }
 
             item.rules = rules;
@@ -565,25 +565,25 @@ impl Db {
         Ok(ret)
     }
 
-    pub fn run_filter(&self, filters: &[ItemFilterRule]) -> Result<Vec<ItemId>, QueryError> {
+    pub fn run_filter(&self, conditions: &[Condition]) -> Result<Vec<ItemId>, QueryError> {
         let mut query_string = "SELECT files.id FROM files ".to_string();
 
-        if !filters.is_empty() {
+        if !conditions.is_empty() {
             query_string += "WHERE ";
         }
 
-        for filter in filters {
-            match filter {
-                ItemFilterRule::NoRelationship(side, id) => {
-                    let side_filter_str = match side {
+        for condition in conditions {
+            match condition {
+                Condition::NoRelationship(side, id) => {
+                    let side_condition_str = match side {
                         RelationshipSide::Dest => "item_relationships.to_id = files.id",
                         RelationshipSide::Source => "item_relationships.from_id = files.id",
                     };
 
                     let id_i64 = id.0;
 
-                    let filter_str = format!("files.id not in (SELECT files.id FROM files JOIN item_relationships ON {side_filter_str} AND relationship_id = {id_i64}) ");
-                    query_string.push_str(&filter_str);
+                    let condition_str = format!("files.id not in (SELECT files.id FROM files JOIN item_relationships ON {side_condition_str} AND relationship_id = {id_i64}) ");
+                    query_string.push_str(&condition_str);
                 }
             }
         }
@@ -1371,7 +1371,7 @@ mod test {
             .db
             .add_filter(
                 "my_filter",
-                &[ItemFilterRule::NoRelationship(
+                &[Condition::NoRelationship(
                     RelationshipSide::Dest,
                     relationship_id,
                 )],
@@ -1385,7 +1385,7 @@ mod test {
         assert_eq!(filters[0].rules.len(), 1);
         assert_eq!(
             filters[0].rules[0],
-            ItemFilterRule::NoRelationship(RelationshipSide::Dest, relationship_id)
+            Condition::NoRelationship(RelationshipSide::Dest, relationship_id)
         );
     }
 

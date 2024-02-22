@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::db::{ItemFilterRule, RelationshipId};
+use crate::db::{Condition, RelationshipId};
 
 pub const API_HANDLE_PATH: &str = "/.api_handle";
 
@@ -103,8 +103,8 @@ enum ItemFilterRuleSerializeProxy {
 }
 
 impl ItemFilterRuleSerializeProxy {
-    fn new(rule: &ItemFilterRule) -> ItemFilterRuleSerializeProxy {
-        use ItemFilterRule::*;
+    fn new(rule: &Condition) -> ItemFilterRuleSerializeProxy {
+        use Condition::*;
         match rule {
             NoRelationship(side, id) => ItemFilterRuleSerializeProxy::NoRelationship {
                 side: side.to_string(),
@@ -114,7 +114,7 @@ impl ItemFilterRuleSerializeProxy {
     }
 }
 
-impl serde::Serialize for ItemFilterRule {
+impl serde::Serialize for Condition {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -124,7 +124,7 @@ impl serde::Serialize for ItemFilterRule {
     }
 }
 
-impl<'de> serde::Deserialize<'de> for ItemFilterRule {
+impl<'de> serde::Deserialize<'de> for Condition {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -144,7 +144,7 @@ impl<'de> serde::Deserialize<'de> for ItemFilterRule {
                         &ExpectedSize,
                     )
                 })?;
-                ItemFilterRule::NoRelationship(side, RelationshipId(id))
+                Condition::NoRelationship(side, RelationshipId(id))
             }
         };
         Ok(ret)
@@ -155,7 +155,7 @@ impl<'de> serde::Deserialize<'de> for ItemFilterRule {
 #[serde(rename_all = "snake_case")]
 pub struct CreateFilterRequest {
     pub name: String,
-    pub filters: Vec<ItemFilterRule>,
+    pub filters: Vec<Condition>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

@@ -1,5 +1,5 @@
 use todo_fs::{
-    db::{ItemFilterRule, RelationshipId},
+    db::{Condition, RelationshipId},
     fuse::api::{self, ClientRequest, CreateFilterRequest},
 };
 
@@ -25,7 +25,7 @@ enum ArgParseError {
     UnknownArg(String),
 }
 
-fn parse_filter<It: Iterator<Item = String>>(it: &mut It) -> Result<ItemFilterRule, ArgParseError> {
+fn parse_filter<It: Iterator<Item = String>>(it: &mut It) -> Result<Condition, ArgParseError> {
     let filter_name = it.next().ok_or(ArgParseError::MissingFilterType)?;
     if filter_name != "no_relationship" {
         return Err(ArgParseError::UnknownFilter(filter_name));
@@ -41,7 +41,7 @@ fn parse_filter<It: Iterator<Item = String>>(it: &mut It) -> Result<ItemFilterRu
         .parse()
         .map_err(ArgParseError::ParseRelationshipId)?;
 
-    Ok(ItemFilterRule::NoRelationship(side, RelationshipId(id)))
+    Ok(Condition::NoRelationship(side, RelationshipId(id)))
 }
 
 fn parse_args<It: Iterator<Item = String>>(

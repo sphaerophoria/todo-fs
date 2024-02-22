@@ -7,7 +7,7 @@ use std::{
 };
 
 use crate::db::{
-    Db, FilterId, GetItemsError, ItemId, ItemRelationship, QueryError, RelationshipId,
+    ConditionSetId, Db, GetItemsError, ItemId, ItemRelationship, QueryError, RelationshipId,
     RelationshipSide,
 };
 use thiserror::Error;
@@ -194,7 +194,7 @@ enum PathPurpose {
     // a path that is passed through to the real filesystem
     PassthroughPath(PathBuf),
     // Named filter that shows items filtered in some way
-    Filter(FilterId),
+    Filter(ConditionSetId),
     // Unknown
     Unknown,
 }
