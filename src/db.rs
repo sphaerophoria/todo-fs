@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 use std::{
-    fmt, fs,
+    fmt::{self, Write}, fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -251,7 +251,7 @@ impl ItemFilter {
     }
 
     pub fn matches(&self, item_id: ItemId, db: &Db) -> Result<bool, QueryError> {
-        Ok(db.run_filter(&self.conditions)?.contains(&item_id))
+        Ok(db.run_filter(&self.conditions, Some(item_id))?.contains(&item_id))
     }
 
     pub fn name(&self) -> &str {
@@ -259,9 +259,66 @@ impl ItemFilter {
     }
 }
 
+// NOTE: Minor optimization. Instead of generating a string from the condition, we can directly
+// push the sql content into whoever the content should be written. To do this we need to implement
+// Display on some struct, so we make a private struct that implements the trait
+struct ConditionSqlGenerator<'a> {
+    condition: &'a Condition,
+    item_context: Option<ItemId>,
+}
+
+impl fmt::Display for ConditionSqlGenerator<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let side_to_condition_str = |side: &RelationshipSide| match side {
+            RelationshipSide::Dest => "item_relationships.to_id = files.id",
+            RelationshipSide::Source => "item_relationships.from_id = files.id",
+        };
+        let side_to_other_side_id_str = |side: &RelationshipSide| match side {
+            RelationshipSide::Dest => "item_relationships.from_id",
+            RelationshipSide::Source => "item_relationships.to_id",
+        };
+        match self.condition {
+            Condition::NoRelationship(side, id) => {
+                let side_condition_str = side_to_condition_str(side);
+                let id_i64 = id.0;
+
+                write!(f, "files.id not in (SELECT files.id FROM files JOIN item_relationships ON {side_condition_str} AND relationship_id = {id_i64})")?;
+            }
+            Condition::HasRelationshipWithVariableItem(side, relationship_id) => {
+                let side_condition_str = side_to_condition_str(side);
+                let other_side_id_str = side_to_other_side_id_str(side);
+                let item_id_i64 = self.item_context.unwrap().0;
+                let relationshipid_i64 = relationship_id.0;
+                write!(f, "files.id in (SELECT files.id FROM files JOIN item_relationships ON {side_condition_str} AND relationship_id = {relationshipid_i64} AND {other_side_id_str} = {item_id_i64})")?;
+            }
+            Condition::NoRelationshipWithSpecificItem(item_id, side, relationship_id) => {
+                let side_condition_str = side_to_condition_str(side);
+                let other_side_id_str = side_to_other_side_id_str(side);
+                let item_id_i64 = item_id.0;
+                let relationshipid_i64 = relationship_id.0;
+                write!(f, "files.id not in (SELECT files.id FROM files JOIN item_relationships ON {side_condition_str} AND relationship_id = {relationshipid_i64} AND {other_side_id_str} = {item_id_i64})")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Condition {
     NoRelationship(RelationshipSide, RelationshipId),
+    // FIXME: Should be variable item_id
+    HasRelationshipWithVariableItem(RelationshipSide, RelationshipId),
+    NoRelationshipWithSpecificItem(ItemId, RelationshipSide, RelationshipId),
+}
+
+impl Condition {
+    fn sql(&self, item_id: Option<ItemId>) -> ConditionSqlGenerator {
+        ConditionSqlGenerator {
+            condition: self,
+            item_context: item_id,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -350,6 +407,22 @@ fn upgrade_v1_v2(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError
             CREATE TABLE item_filters(condition INTEGER, filter INTEGER,
                                       FOREIGN KEY(condition) REFERENCES condition_sets(id),
                                       FOREIGN KEY(filter) REFERENCES condition_sets(id));
+            CREATE TABLE has_relationship_with_variable_item_conditions(
+                condition_id INTEGER,
+                side INTEGER,
+                relationship_id INTEGER,
+                FOREIGN KEY(condition_id) REFERENCES condition_sets(id),
+                FOREIGN KEY(relationship_id) REFERENCES relationships(id)
+                );
+            CREATE TABLE no_relationship_with_specific_item_conditions(
+                condition_id INTEGER,
+                item_id INTEGER,
+                side INTEGER,
+                relationship_id INTEGER,
+                FOREIGN KEY(condition_id) REFERENCES condition_sets(id),
+                FOREIGN KEY(item_id) REFERENCES files(id),
+                FOREIGN KEY(relationship_id) REFERENCES relationships(id)
+                );
             PRAGMA user_version = 2;
             ",
         )
@@ -384,10 +457,124 @@ fn add_condition_set(transaction: &Connection, name: &str, conditions: &[Conditi
             Condition::NoRelationship(side, relationship_id) => {
                 transaction.execute("INSERT INTO no_relationship_conditions(condition_id, side, relationship_id) VALUES (?1, ?2, ?3)", [condition_set_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
             }
+            Condition::HasRelationshipWithVariableItem(side, relationship_id) => {
+                transaction.execute("INSERT INTO has_relationship_with_variable_item_conditions(condition_id, side, relationship_id) VALUES (?1, ?2, ?3)", [condition_set_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
+            }
+            Condition::NoRelationshipWithSpecificItem(item_id, side, relationship_id) => {
+                transaction.execute("INSERT INTO no_relationship_with_specific_item_conditions(condition_id, item_id, side, relationship_id) VALUES (?1, ?2, ?3, ?4)", [condition_set_id, item_id.0, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
+            }
         }
     }
 
     Ok(condition_set_id)
+}
+
+fn load_no_relationship_conditions(transaction: &Connection, condition_set_id: ConditionSetId) -> Result<Vec<Condition>, GetFiltersError> {
+    let mut statement = transaction.prepare("SELECT side, relationship_id FROM no_relationship_conditions WHERE condition_id = ?1").map_err(QueryError::Prepare)
+        .map_err(GetFiltersError::QueryRules)?;
+
+    let mut rules = Vec::new();
+
+    let mut query = statement
+        .query([condition_set_id.0])
+        .map_err(QueryError::Execute)
+        .map_err(GetFiltersError::QueryRules)?;
+
+    while let Some(row) = query
+        .next()
+        .map_err(QueryError::QueryMapFailed)
+        .map_err(GetFiltersError::QueryRules)?
+    {
+        let side: i64 = row
+            .get(0)
+            .map_err(QueryError::QueryMapFailed)
+            .map_err(GetFiltersError::QueryRules)?;
+        let side = RelationshipSide::from_i64(side)
+            .map_err(GetFiltersError::InvalidRelationshipSide)?;
+
+        let relationship_id: i64 = row
+            .get(1)
+            .map_err(QueryError::QueryMapFailed)
+            .map_err(GetFiltersError::QueryRules)?;
+        let relationship_id = RelationshipId(relationship_id);
+        rules.push(Condition::NoRelationship(side, relationship_id));
+    }
+
+    Ok(rules)
+}
+
+fn load_has_relationship_with_variable_item_conditions(transaction: &Connection, condition_set_id: ConditionSetId) -> Result<Vec<Condition>, GetFiltersError> {
+    let mut statement = transaction.prepare("SELECT side, relationship_id FROM has_relationship_with_variable_item_conditions WHERE condition_id = ?1").map_err(QueryError::Prepare)
+        .map_err(GetFiltersError::QueryRules)?;
+
+    let mut rules = Vec::new();
+
+    let mut query = statement
+        .query([condition_set_id.0])
+        .map_err(QueryError::Execute)
+        .map_err(GetFiltersError::QueryRules)?;
+
+    while let Some(row) = query
+        .next()
+        .map_err(QueryError::QueryMapFailed)
+        .map_err(GetFiltersError::QueryRules)?
+    {
+        let side: i64 = row
+            .get(0)
+            .map_err(QueryError::QueryMapFailed)
+            .map_err(GetFiltersError::QueryRules)?;
+        let side = RelationshipSide::from_i64(side)
+            .map_err(GetFiltersError::InvalidRelationshipSide)?;
+
+        let relationship_id: i64 = row
+            .get(1)
+            .map_err(QueryError::QueryMapFailed)
+            .map_err(GetFiltersError::QueryRules)?;
+        let relationship_id = RelationshipId(relationship_id);
+        rules.push(Condition::HasRelationshipWithVariableItem(side, relationship_id));
+    }
+
+    Ok(rules)
+}
+
+fn load_no_relationship_with_specific_item_conditions(transaction: &Connection, condition_set_id: ConditionSetId) -> Result<Vec<Condition>, GetFiltersError> {
+    let mut statement = transaction.prepare("SELECT item_id, side, relationship_id FROM no_relationship_with_specific_item_conditions WHERE condition_id = ?1").map_err(QueryError::Prepare)
+        .map_err(GetFiltersError::QueryRules)?;
+
+    let mut rules = Vec::new();
+
+    let mut query = statement
+        .query([condition_set_id.0])
+        .map_err(QueryError::Execute)
+        .map_err(GetFiltersError::QueryRules)?;
+
+    while let Some(row) = query
+        .next()
+        .map_err(QueryError::QueryMapFailed)
+        .map_err(GetFiltersError::QueryRules)?
+    {
+        let item_id: i64 = row
+            .get(0)
+            .map_err(QueryError::QueryMapFailed)
+            .map_err(GetFiltersError::QueryRules)?;
+        let item_id = ItemId(item_id);
+
+        let side: i64 = row
+            .get(1)
+            .map_err(QueryError::QueryMapFailed)
+            .map_err(GetFiltersError::QueryRules)?;
+        let side = RelationshipSide::from_i64(side)
+            .map_err(GetFiltersError::InvalidRelationshipSide)?;
+
+        let relationship_id: i64 = row
+            .get(2)
+            .map_err(QueryError::QueryMapFailed)
+            .map_err(GetFiltersError::QueryRules)?;
+        let relationship_id = RelationshipId(relationship_id);
+        rules.push(Condition::NoRelationshipWithSpecificItem(item_id, side, relationship_id));
+    }
+
+    Ok(rules)
 }
 
 #[derive(Debug)]
@@ -660,64 +847,28 @@ impl Db {
         let mut ret = ret.map_err(GetFiltersError::QueryFilters)?;
 
         for item in &mut ret {
-            let mut statement = transaction.prepare("SELECT side, relationship_id FROM no_relationship_conditions WHERE condition_id = ?1").map_err(QueryError::Prepare)
-                .map_err(GetFiltersError::QueryRules)?;
-
-            let mut rules = Vec::new();
-
-            let mut query = statement
-                .query([item.id.0])
-                .map_err(QueryError::Execute)
-                .map_err(GetFiltersError::QueryRules)?;
-
-            while let Some(row) = query
-                .next()
-                .map_err(QueryError::QueryMapFailed)
-                .map_err(GetFiltersError::QueryRules)?
-            {
-                let side: i64 = row
-                    .get(0)
-                    .map_err(QueryError::QueryMapFailed)
-                    .map_err(GetFiltersError::QueryRules)?;
-                let side = RelationshipSide::from_i64(side)
-                    .map_err(GetFiltersError::InvalidRelationshipSide)?;
-
-                let relationship_id: i64 = row
-                    .get(1)
-                    .map_err(QueryError::QueryMapFailed)
-                    .map_err(GetFiltersError::QueryRules)?;
-                let relationship_id = RelationshipId(relationship_id);
-                rules.push(Condition::NoRelationship(side, relationship_id));
-            }
-
+            let mut rules = load_no_relationship_conditions(&transaction, item.id).unwrap();
+            rules.extend(load_has_relationship_with_variable_item_conditions(&transaction, item.id).unwrap());
+            rules.extend(load_no_relationship_with_specific_item_conditions(&transaction, item.id).unwrap());
             item.rules = rules;
         }
 
         Ok(ret)
     }
 
-    pub fn run_filter(&self, conditions: &[Condition]) -> Result<Vec<ItemId>, QueryError> {
+    pub fn run_filter(&self, conditions: &[Condition], item_id: Option<ItemId>) -> Result<Vec<ItemId>, QueryError> {
         let mut query_string = "SELECT files.id FROM files ".to_string();
 
-        if !conditions.is_empty() {
-            query_string += "WHERE ";
+        let mut conditions_it = conditions.iter();
+        if let Some(condition) = conditions_it.next() {
+            write!(query_string, "WHERE ({}) ", condition.sql(item_id)).unwrap();
         }
 
-        for condition in conditions {
-            match condition {
-                Condition::NoRelationship(side, id) => {
-                    let side_condition_str = match side {
-                        RelationshipSide::Dest => "item_relationships.to_id = files.id",
-                        RelationshipSide::Source => "item_relationships.from_id = files.id",
-                    };
-
-                    let id_i64 = id.0;
-
-                    let condition_str = format!("files.id not in (SELECT files.id FROM files JOIN item_relationships ON {side_condition_str} AND relationship_id = {id_i64}) ");
-                    query_string.push_str(&condition_str);
-                }
-            }
+        for condition in conditions_it {
+            write!(query_string, "AND ({}) ", condition.sql(item_id)).unwrap();
         }
+
+        println!("{}", query_string);
 
         let mut statement = self
             .connection
@@ -771,8 +922,8 @@ impl Db {
             .map_err(AddFilterError::StartTransaction)?;
 
         // FIXME: Unique error types
-        let condition_id = add_condition_set(&transaction, name, conditions)?;
-        let filter_id = add_condition_set(&transaction, name, filters)?;
+        let condition_id = add_condition_set(&transaction, name, conditions).unwrap();
+        let filter_id = add_condition_set(&transaction, name, filters).unwrap();
 
         transaction
             .execute(

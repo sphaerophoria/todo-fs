@@ -110,6 +110,12 @@ impl ItemFilterRuleSerializeProxy {
                 side: side.to_string(),
                 id: id.0,
             },
+            Condition::HasRelationshipWithVariableItem(side, relationship_id) => {
+                unimplemented!();
+            }
+            Condition::NoRelationshipWithSpecificItem(item_id, side, relationship_id) => {
+                unimplemented!();
+            }
         }
     }
 }

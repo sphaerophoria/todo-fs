@@ -602,7 +602,7 @@ impl FuseClient {
 
                 let item_ids = self
                     .db
-                    .run_filter(&filter.rules)
+                    .run_filter(&filter.rules, None)
                     .map_err(ReadDirError::RunFilter)?;
 
                 let item_it = item_ids.into_iter().map(|item_id| {
@@ -618,7 +618,7 @@ impl FuseClient {
 
                 Box::new(item_it)
             }
-            PathPurpose::ItemFilter(_id, filter_id) => {
+            PathPurpose::ItemFilter(id, filter_id) => {
                 // FIXME: 100% duplciated with above, unsure if it will stay this way
                 let filter = self
                     .db
@@ -630,7 +630,7 @@ impl FuseClient {
 
                 let item_ids = self
                     .db
-                    .run_filter(&filter.rules)
+                    .run_filter(&filter.rules, Some(id))
                     .map_err(ReadDirError::RunFilter)?;
 
                 let item_it = item_ids.into_iter().map(|item_id| {

@@ -1,8 +1,9 @@
 use todo_fs::{
-    db::{Condition, RelationshipId},
+    db::{Condition, RelationshipId, ItemId},
     fuse::api::{self, ClientRequest, CreateFilterRequest},
 };
 
+use std::borrow::Borrow;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -25,13 +26,45 @@ enum ArgParseError {
     UnknownArg(String),
 }
 
-// FIXME: Duplicated
+// FIXME: Dedup with create-root-filter.rs
 fn parse_filter<It: Iterator<Item = String>>(it: &mut It) -> Result<Condition, ArgParseError> {
     let filter_name = it.next().ok_or(ArgParseError::MissingFilterType)?;
-    if filter_name != "no_relationship" {
-        return Err(ArgParseError::UnknownFilter(filter_name));
+    match filter_name.borrow() {
+        "no_relationship" => {
+            parse_no_relationship_filter(it)
+        }
+        "has_relationship_with_variable_item" => {
+            parse_has_relationship_with_item(it)
+        }
+        "no_relationship_with_specific_item" => {
+            parse_no_relationship_with_item(it)
+        }
+        _ => Err(ArgParseError::UnknownFilter(filter_name))
     }
 
+}
+
+fn parse_has_relationship_with_item<It: Iterator<Item = String>>(it: &mut It) -> Result<Condition, ArgParseError> {
+    let side = it.next().unwrap();
+    let side = side.parse().unwrap();
+    let relationship_id = it.next().unwrap();
+    let relationship_id = relationship_id.parse().unwrap();
+
+    Ok(Condition::HasRelationshipWithVariableItem(side, RelationshipId(relationship_id)))
+}
+
+fn parse_no_relationship_with_item<It: Iterator<Item = String>>(it: &mut It) -> Result<Condition, ArgParseError> {
+    let item_id = it.next().unwrap();
+    let item_id = item_id.parse().unwrap();
+    let side = it.next().unwrap();
+    let side = side.parse().unwrap();
+    let relationship_id = it.next().unwrap();
+    let relationship_id = relationship_id.parse().unwrap();
+
+    Ok(Condition::NoRelationshipWithSpecificItem(ItemId(item_id), side, RelationshipId(relationship_id)))
+}
+
+fn parse_no_relationship_filter<It: Iterator<Item = String>>(it: &mut It) -> Result<Condition, ArgParseError> {
     let side = it.next().ok_or(ArgParseError::MissingSide)?;
     let relationship_id = it.next().ok_or(ArgParseError::MissingRelationshipId)?;
 
@@ -98,7 +131,13 @@ fn help() -> ! {
              Filter options:\n\
              no_relationship [side] [relationship_id]\n\
              \tShows elements that do not have a relationship where they are on the provided side\n\
-             \tside: [dest, source]\
+             \tside: [dest, source]\n\
+             has_relationship_with_variable_item [side] [relationship_id]\n\
+             \tShows elements that have a relationship with the item associated with the filter from a specific side\n\
+             \tside: [dest, source]\n\
+             no_relationship_with_specific_item [item_id] [side] [relationship_id]\n\
+             \tShows elements that have no relationship with a specific item from a specific side\n\
+             \tside: [dest, source]\n\
              ",
         program_name
     );
