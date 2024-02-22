@@ -219,18 +219,52 @@ pub enum GetRootFiltersError {
     ResolveFilters(#[from] GetFiltersError),
 }
 
+#[derive(Debug, Error)]
+pub enum GetConditionalFiltersError {
+    #[error("failed to prepare statement")]
+    Prepare(#[source] rusqlite::Error),
+    #[error("failed to execute query")]
+    Query(#[source] rusqlite::Error),
+    #[error("failed to get filter ids from query")]
+    Map(#[source] rusqlite::Error),
+    #[error("failed to match condition to id")]
+    MatchId,
+    #[error("failed to resolve filters")]
+    ResolveFilters(#[from] GetFiltersError),
+}
+
 #[derive(Debug)]
 pub struct Db {
     item_path: PathBuf,
     connection: Connection,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+pub struct ItemFilter {
+    to_run: ConditionSetId,
+    name: String,
+    conditions: Vec<Condition>,
+}
+
+impl ItemFilter {
+    pub fn filter_to_run(&self) -> ConditionSetId {
+        self.to_run
+    }
+
+    pub fn matches(&self, item_id: ItemId, db: &Db) -> Result<bool, QueryError> {
+        Ok(db.run_filter(&self.conditions)?.contains(&item_id))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Condition {
     NoRelationship(RelationshipSide, RelationshipId),
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConditionSetId(i64);
 
 #[derive(Debug)]
@@ -722,6 +756,45 @@ impl Db {
             .into_iter()
             .filter(|filter| root_filter_ids.contains(&filter.id))
             .collect();
+        Ok(ret)
+    }
+
+    pub fn get_item_filters(&mut self) -> Result<Vec<ItemFilter>, GetConditionalFiltersError> {
+        let item_filter_ids: Vec<(ConditionSetId, ConditionSetId)> = {
+            let mut filters_statement = self
+                .connection
+                .prepare("SELECT condition, filter FROM item_filters")
+                .map_err(GetConditionalFiltersError::Prepare)?;
+
+            // Rust does not handle lifetimes correctly without let binding
+            #[allow(clippy::let_and_return)]
+            let ret = filters_statement
+                .query_map((), |row| {
+                    let condition_id = ConditionSetId(row.get(0)?);
+                    let filters_to_run = ConditionSetId(row.get(1)?);
+                    Ok((condition_id, filters_to_run))
+                })
+                .map_err(GetConditionalFiltersError::Query)?
+                .collect::<Result<_, _>>()
+                .map_err(GetConditionalFiltersError::Map)?;
+            ret
+        };
+
+        let all_filters = self.get_condition_sets()?;
+        let mut ret = Vec::new();
+        for (condition_id, filters_to_run) in item_filter_ids {
+            let conditions = all_filters
+                .iter()
+                .find(|filter| condition_id == filter.id)
+                .ok_or(GetConditionalFiltersError::MatchId)?;
+            ret.push(ItemFilter {
+                to_run: filters_to_run,
+                // FIXME: Probably needless clones, should be 1-1 mapping between item_filter_ids
+                // and all_filters
+                name: conditions.name.clone(),
+                conditions: conditions.rules.clone(),
+            })
+        }
         Ok(ret)
     }
 

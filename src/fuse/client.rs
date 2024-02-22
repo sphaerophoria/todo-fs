@@ -44,6 +44,8 @@ pub enum ReadDirError {
     ItemIdNotInDatabase,
     #[error("failed to categorize relationships")]
     CategorizeRelationships(#[source] CategorizeRelationshipsError),
+    #[error("failed to get all filters from db")]
+    GetAllFilters(#[source] crate::db::GetFiltersError),
     #[error("failed to get root filters from db")]
     GetRootFilters(#[source] crate::db::GetRootFiltersError),
     #[error("failed to find filter for given ID")]
@@ -54,6 +56,8 @@ pub enum ReadDirError {
     GetContentFolder(#[source] std::io::Error),
     #[error("failed to get filetype for path")]
     GetFiletype(#[source] PathPurposeToFiletypeError),
+    #[error("check item filter condition")]
+    CheckItemFiltercondition(#[source] ProcessConditionalFiltersError),
     #[error("read dir called on non directory")]
     NotADirectory,
 }
@@ -120,6 +124,14 @@ pub enum PathPurposeToFiletypeError {
     RelationshipToName(#[source] QueryError),
 }
 
+#[derive(Debug, Error)]
+pub enum ProcessConditionalFiltersError {
+    #[error("failed to get filters from db")]
+    GetFilters(#[source] GetConditionalFiltersError),
+    #[error("failed check if filter should be run")]
+    CheckFilterMatch(#[source] QueryError),
+}
+
 fn categorize_relationships(
     relationships: &Vec<ItemRelationship>,
     db: &Db,
@@ -143,6 +155,32 @@ fn categorize_relationships(
     }
 
     Ok(ret.into_iter().collect())
+}
+
+fn get_item_filters_for_item_as_path_purpose(
+    id: ItemId,
+    db: &mut Db,
+) -> Result<Vec<(PathPurpose, String)>, ProcessConditionalFiltersError> {
+    let mut ret = Vec::new();
+    let conditional_filters = db
+        .get_item_filters()
+        .map_err(ProcessConditionalFiltersError::GetFilters)?;
+
+    for filter in conditional_filters {
+        if !filter
+            .matches(id, db)
+            .map_err(ProcessConditionalFiltersError::CheckFilterMatch)?
+        {
+            continue;
+        }
+
+        ret.push((
+            PathPurpose::ItemFilter(id, filter.filter_to_run()),
+            filter.name().to_string(),
+        ));
+    }
+
+    Ok(ret)
 }
 
 pub enum DirEntry {
@@ -195,6 +233,8 @@ enum PathPurpose {
     PassthroughPath(PathBuf),
     // Named filter that shows items filtered in some way
     Filter(ConditionSetId),
+    // Named filter that shows items filtered for this specific item
+    ItemFilter(ItemId, ConditionSetId),
     // Unknown
     Unknown,
 }
@@ -254,6 +294,7 @@ fn path_purpose_to_filetype(
         | PathPurpose::Item(_)
         | PathPurpose::Relationship(_)
         | PathPurpose::Filter(_)
+        | PathPurpose::ItemFilter(_, _)
         | PathPurpose::ItemRelationships(_, _, _)
         | PathPurpose::Unknown => Filetype::Dir,
         PathPurpose::ItemLink(_) => Filetype::Link,
@@ -533,20 +574,56 @@ impl FuseClient {
                     },
                 );
 
-                Box::new(names.chain([
-                    (
-                        PathPurpose::PassthroughPath(passthrough_path),
-                        "content".to_string(),
-                    ),
-                    (PathPurpose::ItemId(id), "id".to_string()),
-                    (PathPurpose::ItemName(id), "name".to_string()),
-                ]))
+                let conditional_filter_paths =
+                    get_item_filters_for_item_as_path_purpose(id, &mut self.db)
+                        .map_err(ReadDirError::CheckItemFiltercondition)?;
+
+                Box::new(
+                    names
+                        .chain([
+                            (
+                                PathPurpose::PassthroughPath(passthrough_path),
+                                "content".to_string(),
+                            ),
+                            (PathPurpose::ItemId(id), "id".to_string()),
+                            (PathPurpose::ItemName(id), "name".to_string()),
+                        ])
+                        .chain(conditional_filter_paths),
+                )
             }
             PathPurpose::Filter(filter_id) => {
                 let filter = self
                     .db
                     .get_root_filters()
                     .map_err(ReadDirError::GetRootFilters)?
+                    .into_iter()
+                    .find(|filter| filter.id == filter_id)
+                    .ok_or(ReadDirError::FindFilter)?;
+
+                let item_ids = self
+                    .db
+                    .run_filter(&filter.rules)
+                    .map_err(ReadDirError::RunFilter)?;
+
+                let item_it = item_ids.into_iter().map(|item_id| {
+                    let name = self
+                        .db
+                        .get_item_by_id(item_id)
+                        .ok_or(ReadDirError::ItemIdNotInDatabase)?
+                        .name;
+                    Ok((PathPurpose::ItemLink(item_id), name))
+                });
+
+                let item_it = item_it.collect::<Result<Vec<_>, _>>()?.into_iter();
+
+                Box::new(item_it)
+            }
+            PathPurpose::ItemFilter(_id, filter_id) => {
+                // FIXME: 100% duplciated with above, unsure if it will stay this way
+                let filter = self
+                    .db
+                    .get_condition_sets()
+                    .map_err(ReadDirError::GetAllFilters)?
                     .into_iter()
                     .find(|filter| filter.id == filter_id)
                     .ok_or(ReadDirError::FindFilter)?;
