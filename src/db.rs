@@ -1,7 +1,4 @@
-#![allow(unused)]
-
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
@@ -100,9 +97,12 @@ pub enum DeleteItemError {
     DeleteItem(#[source] rusqlite::Error),
     #[error("failed to delete item relationships")]
     DeleteItemRelationships(#[source] rusqlite::Error),
+    #[error("failed to remove item from disk")]
+    RemoveItemPath(#[source] std::io::Error),
     #[error("failed to commit transaction")]
     CommitTransaction(#[source] rusqlite::Error),
 }
+
 #[derive(Debug, Error)]
 pub enum OpenDbError {
     #[error("failed to create directory for content")]
@@ -299,7 +299,7 @@ impl Db {
             .map_err(CreateItemError::StartTransaction)?;
         transaction
             .execute("INSERT INTO files(name) VALUES (?1)", [name])
-            .map_err(CreateItemError::InsertItem);
+            .map_err(CreateItemError::InsertItem)?;
         let id = transaction.last_insert_rowid();
 
         let item_path = self.item_path.join(id.to_string());
@@ -307,7 +307,7 @@ impl Db {
             return Err(CreateItemError::ItemExists);
         }
 
-        fs::create_dir_all(item_path).map_err(CreateItemError::CreateContentFolder);
+        fs::create_dir_all(item_path).map_err(CreateItemError::CreateContentFolder)?;
 
         transaction
             .commit()
@@ -333,7 +333,7 @@ impl Db {
             .map_err(DeleteItemError::DeleteItem)?;
 
         let item_path = self.item_path.join(id.0.to_string());
-        fs::remove_dir_all(item_path);
+        fs::remove_dir_all(item_path).map_err(DeleteItemError::RemoveItemPath)?;
 
         transaction
             .commit()
@@ -500,7 +500,7 @@ impl Db {
     }
 
     pub fn get_filters(&mut self) -> Result<Vec<ConditionSet>, GetFiltersError> {
-        let mut transaction = self
+        let transaction = self
             .connection
             .transaction()
             .map_err(GetFiltersError::StartTransaction)?;
