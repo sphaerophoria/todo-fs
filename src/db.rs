@@ -111,20 +111,32 @@ pub enum OpenDbError {
     OpenConnection(#[source] rusqlite::Error),
     #[error("failed to start transaction")]
     StartTransaction(#[source] rusqlite::Error),
+    #[error("failed to enable foreign key checks")]
+    EnableForeignKeys(#[source] rusqlite::Error),
+    #[error("failed to commit transactions")]
+    CommitTransaction(#[source] rusqlite::Error),
+    #[error("failed to create no relationships filters table")]
+    UpgradeDb(#[source] UpgradeDbError),
+}
+
+#[derive(Debug, Error)]
+pub enum UpgradeDbError {
+    #[error("failed to get version")]
+    GetVersion(#[source] QueryError),
     #[error("failed to create files table")]
     CreateFilesTable(#[source] rusqlite::Error),
     #[error("failed to create relationships table")]
     CreateRelationshipsTable(#[source] rusqlite::Error),
     #[error("failed to create item relationships table")]
     CreateItemRelationshipsTable(#[source] rusqlite::Error),
-    #[error("failed to enable foreign key checks")]
-    EnableForeignKeys(#[source] rusqlite::Error),
-    #[error("failed to commit transactions")]
-    CommitTransaction(#[source] rusqlite::Error),
     #[error("failed to create filters table")]
     CreateFiltersTable(#[source] rusqlite::Error),
     #[error("failed to create no relationships filters table")]
     CreateNoRelationshipsFilterTable(#[source] rusqlite::Error),
+    #[error("failed to set user version")]
+    SetUserVersion(#[source] rusqlite::Error),
+    #[error("failed to update v1 to v2 schema")]
+    UpgradeV1ToV2(#[source] rusqlite::Error),
 }
 
 #[derive(Debug, Error)]
@@ -159,6 +171,8 @@ pub enum AddFilterError {
     InsertFilter(#[source] rusqlite::Error),
     #[error("failed to insert rule")]
     InsertRule(#[source] rusqlite::Error),
+    #[error("failed to insert root filter")]
+    InsertRootFilter(#[source] rusqlite::Error),
     #[error("failed to commit transaction")]
     CommitTransaction(#[source] rusqlite::Error),
 }
@@ -193,6 +207,18 @@ pub enum GetFiltersError {
     InvalidRelationshipSide(#[source] ParseRelationshipSideError),
 }
 
+#[derive(Debug, Error)]
+pub enum GetRootFiltersError {
+    #[error("failed to prepare statement")]
+    Prepare(#[source] rusqlite::Error),
+    #[error("failed to execute query")]
+    Query(#[source] rusqlite::Error),
+    #[error("failed to get filter id from query")]
+    Map(#[source] rusqlite::Error),
+    #[error("failed to resolve filters")]
+    ResolveFilters(#[from] GetFiltersError),
+}
+
 #[derive(Debug)]
 pub struct Db {
     item_path: PathBuf,
@@ -212,6 +238,103 @@ pub struct ConditionSet {
     pub id: ConditionSetId,
     pub name: String,
     pub rules: Vec<Condition>,
+}
+
+pub fn get_version(connection: &rusqlite::Connection) -> Result<usize, QueryError> {
+    let mut statement = connection
+        .prepare("PRAGMA user_version")
+        .map_err(QueryError::Prepare)?;
+
+    statement
+        .query_row([], |row| {
+            let ret: usize = row.get(0)?;
+            Ok(ret)
+        })
+        .map_err(QueryError::QueryMapFailed)
+}
+
+pub fn generate_v1_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
+            (),
+        )
+        .map_err(UpgradeDbError::CreateFilesTable)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS relationships(id INTEGER PRIMARY KEY, from_name TEXT NOT NULL, to_name TEXT_NOT_NULL)",
+            (),
+        )
+        .map_err(UpgradeDbError::CreateRelationshipsTable)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS filters(id INTEGER PRIMARY KEY, name TEXT_NOT_NULL)",
+            (),
+        )
+        .map_err(UpgradeDbError::CreateFiltersTable)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS no_relationship_filters(filter_id INTEGER, side INTEGER, relationship_id INTEGER,
+            FOREIGN KEY(filter_id) REFERENCES filters(id),
+            FOREIGN KEY(relationship_id) REFERENCES relationships(id),
+            UNIQUE(filter_id, side, relationship_id))",
+            (),
+        )
+        .map_err(UpgradeDbError::CreateNoRelationshipsFilterTable)?;
+
+    connection
+        .execute(
+            "CREATE TABLE IF NOT EXISTS item_relationships(from_id INTEGER, to_id INTEGER, relationship_id INTEGER,
+            FOREIGN KEY(from_id) REFERENCES files(id),
+            FOREIGN KEY(to_id) REFERENCES files(id),
+            FOREIGN KEY(relationship_id) REFERENCES relationships(id),
+            UNIQUE(from_id, to_id, relationship_id))",
+            (),
+        )
+        .map_err(UpgradeDbError::CreateItemRelationshipsTable)?;
+
+    connection
+        .execute("PRAGMA user_version = 1", ())
+        .map_err(UpgradeDbError::SetUserVersion)?;
+
+    Ok(())
+}
+
+pub fn upgrade_v1_v2(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
+    connection
+        .execute_batch(
+            "
+            ALTER TABLE filters RENAME TO condition_sets;
+            ALTER TABLE no_relationship_filters RENAME TO no_relationship_conditions;
+            ALTER TABLE no_relationship_conditions RENAME COLUMN filter_id TO condition_id;
+            CREATE TABLE root_filters(id INTEGER PRIMARY KEY,
+                                      FOREIGN KEY(id) REFERENCES condition_sets(id));
+            INSERT INTO root_filters(id) SELECT id FROM condition_sets;
+            CREATE TABLE item_filters(condition INTEGER, filter INTEGER,
+                                      FOREIGN KEY(condition) REFERENCES condition_sets(id),
+                                      FOREIGN KEY(filter) REFERENCES condition_sets(id));
+            PRAGMA user_version = 2;
+            ",
+        )
+        .map_err(UpgradeDbError::UpgradeV1ToV2)
+}
+
+pub fn upgrade_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
+    let current_version = get_version(connection).map_err(UpgradeDbError::GetVersion)?;
+    let upgrade_fns = [generate_v1_db, upgrade_v1_v2];
+
+    for upgrade_fn in upgrade_fns.iter().skip(current_version) {
+        upgrade_fn(connection)?;
+    }
+
+    let updated_version = get_version(connection).map_err(UpgradeDbError::GetVersion)?;
+
+    const EXPECTED_VERSION: usize = 2;
+    assert_eq!(updated_version, EXPECTED_VERSION);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -240,47 +363,7 @@ impl Db {
             .transaction()
             .map_err(OpenDbError::StartTransaction)?;
 
-        transaction
-            .execute(
-                "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
-                (),
-            )
-            .map_err(OpenDbError::CreateFilesTable)?;
-
-        transaction
-            .execute(
-                "CREATE TABLE IF NOT EXISTS relationships(id INTEGER PRIMARY KEY, from_name TEXT NOT NULL, to_name TEXT_NOT_NULL)",
-                (),
-            )
-            .map_err(OpenDbError::CreateRelationshipsTable)?;
-
-        transaction
-            .execute(
-                "CREATE TABLE IF NOT EXISTS filters(id INTEGER PRIMARY KEY, name TEXT_NOT_NULL)",
-                (),
-            )
-            .map_err(OpenDbError::CreateFiltersTable)?;
-
-        transaction
-            .execute(
-                "CREATE TABLE IF NOT EXISTS no_relationship_filters(filter_id INTEGER, side INTEGER, relationship_id INTEGER,
-                FOREIGN KEY(filter_id) REFERENCES filters(id),
-                FOREIGN KEY(relationship_id) REFERENCES relationships(id),
-                UNIQUE(filter_id, side, relationship_id))",
-                (),
-            )
-            .map_err(OpenDbError::CreateNoRelationshipsFilterTable)?;
-
-        transaction
-            .execute(
-                "CREATE TABLE IF NOT EXISTS item_relationships(from_id INTEGER, to_id INTEGER, relationship_id INTEGER,
-                FOREIGN KEY(from_id) REFERENCES files(id),
-                FOREIGN KEY(to_id) REFERENCES files(id),
-                FOREIGN KEY(relationship_id) REFERENCES relationships(id),
-                UNIQUE(from_id, to_id, relationship_id))",
-                (),
-            )
-            .map_err(OpenDbError::CreateItemRelationshipsTable)?;
+        upgrade_db(&transaction).map_err(OpenDbError::UpgradeDb)?;
 
         transaction
             .commit()
@@ -479,15 +562,24 @@ impl Db {
             .map_err(AddFilterError::StartTransaction)?;
 
         transaction
-            .execute("INSERT INTO filters(name) VALUES (?1)", [name])
+            .execute("INSERT INTO condition_sets(name) VALUES (?1)", [name])
             .map_err(AddFilterError::InsertFilter)?;
+
+        let inserted_condition_set = transaction.last_insert_rowid();
+
+        transaction
+            .execute(
+                "INSERT INTO root_filters(id) VALUES (?1)",
+                [inserted_condition_set],
+            )
+            .map_err(AddFilterError::InsertRootFilter)?;
 
         let filter_id = transaction.last_insert_rowid();
 
         for condition in conditions {
             match condition {
                 Condition::NoRelationship(side, relationship_id) => {
-                    transaction.execute("INSERT INTO no_relationship_filters(filter_id, side, relationship_id) VALUES (?1, ?2, ?3)", [filter_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
+                    transaction.execute("INSERT INTO no_relationship_conditions(condition_id, side, relationship_id) VALUES (?1, ?2, ?3)", [filter_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
                 }
             }
         }
@@ -499,14 +591,14 @@ impl Db {
         Ok(())
     }
 
-    pub fn get_filters(&mut self) -> Result<Vec<ConditionSet>, GetFiltersError> {
+    pub fn get_condition_sets(&mut self) -> Result<Vec<ConditionSet>, GetFiltersError> {
         let transaction = self
             .connection
             .transaction()
             .map_err(GetFiltersError::StartTransaction)?;
 
         let mut statement = transaction
-            .prepare("SELECT id, name FROM filters")
+            .prepare("SELECT id, name FROM condition_sets")
             .map_err(QueryError::Prepare)
             .map_err(GetFiltersError::QueryFilters)?;
 
@@ -529,7 +621,7 @@ impl Db {
         let mut ret = ret.map_err(GetFiltersError::QueryFilters)?;
 
         for item in &mut ret {
-            let mut statement = transaction.prepare("SELECT side, relationship_id FROM no_relationship_filters WHERE filter_id = ?1").map_err(QueryError::Prepare)
+            let mut statement = transaction.prepare("SELECT side, relationship_id FROM no_relationship_conditions WHERE condition_id = ?1").map_err(QueryError::Prepare)
                 .map_err(GetFiltersError::QueryRules)?;
 
             let mut rules = Vec::new();
@@ -603,6 +695,34 @@ impl Db {
             .collect();
 
         ret
+    }
+
+    pub fn get_root_filters(&mut self) -> Result<Vec<ConditionSet>, GetRootFiltersError> {
+        let root_filter_ids: Vec<ConditionSetId> = {
+            let mut filters_statement = self
+                .connection
+                .prepare("SELECT id FROM root_filters")
+                .map_err(GetRootFiltersError::Prepare)?;
+
+            // Rust does not handle lifetimes correctly without the let binding
+            #[allow(clippy::let_and_return)]
+            let ret = filters_statement
+                .query_map((), |row| {
+                    let id = ConditionSetId(row.get(0)?);
+                    Ok(id)
+                })
+                .map_err(GetRootFiltersError::Query)?
+                .collect::<Result<_, _>>()
+                .map_err(GetRootFiltersError::Map)?;
+            ret
+        };
+
+        let ret = self
+            .get_condition_sets()?
+            .into_iter()
+            .filter(|filter| root_filter_ids.contains(&filter.id))
+            .collect();
+        Ok(ret)
     }
 
     pub fn content_folder_for_id(&self, id: ItemId) -> Result<PathBuf, std::io::Error> {
@@ -1378,7 +1498,10 @@ mod test {
             )
             .expect("failed to add filter");
 
-        let filters = fixture.db.get_filters().expect("failed to get filters");
+        let filters = fixture
+            .db
+            .get_root_filters()
+            .expect("failed to get filters");
 
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].name, "my_filter");

@@ -44,8 +44,8 @@ pub enum ReadDirError {
     ItemIdNotInDatabase,
     #[error("failed to categorize relationships")]
     CategorizeRelationships(#[source] CategorizeRelationshipsError),
-    #[error("failed to get filters from db")]
-    GetFilters(#[source] crate::db::GetFiltersError),
+    #[error("failed to get root filters from db")]
+    GetRootFilters(#[source] crate::db::GetRootFiltersError),
     #[error("failed to find filter for given ID")]
     FindFilter,
     #[error("failed to run filter")]
@@ -476,8 +476,8 @@ impl FuseClient {
 
                 let filters_iter = self
                     .db
-                    .get_filters()
-                    .map_err(ReadDirError::GetFilters)?
+                    .get_root_filters()
+                    .map_err(ReadDirError::GetRootFilters)?
                     .into_iter()
                     .map(|filter| (PathPurpose::Filter(filter.id), filter.name));
 
@@ -545,8 +545,8 @@ impl FuseClient {
             PathPurpose::Filter(filter_id) => {
                 let filter = self
                     .db
-                    .get_filters()
-                    .map_err(ReadDirError::GetFilters)?
+                    .get_root_filters()
+                    .map_err(ReadDirError::GetRootFilters)?
                     .into_iter()
                     .find(|filter| filter.id == filter_id)
                     .ok_or(ReadDirError::FindFilter)?;
