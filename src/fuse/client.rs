@@ -8,7 +8,7 @@ use std::{
 
 use crate::db::{
     ConditionSetId, Db, GetItemsError, ItemId, ItemRelationship, QueryError, RelationshipId,
-    RelationshipSide,
+    RelationshipSide, GetConditionalFiltersError
 };
 use thiserror::Error;
 
@@ -435,7 +435,7 @@ impl FuseClient {
                     .map_err(WriteError::SerializeResponse)?;
             }
             ClientRequest::CreateFilter(req) => {
-                self.db.add_filter(&req.name, &req.filters)?;
+                self.db.add_root_filter(&req.name, &req.filters)?;
             }
             ClientRequest::CreateItemRelationship(req) => {
                 println!("Adding item relationship");
@@ -658,7 +658,8 @@ impl FuseClient {
                     "create-item",
                     "create-item-relationship",
                     "create-relationship",
-                    "create-filter",
+                    "create-root-filter",
+                    "create-item-filter",
                     "delete-item",
                 ];
 

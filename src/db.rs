@@ -274,7 +274,7 @@ pub struct ConditionSet {
     pub rules: Vec<Condition>,
 }
 
-pub fn get_version(connection: &rusqlite::Connection) -> Result<usize, QueryError> {
+fn get_version(connection: &rusqlite::Connection) -> Result<usize, QueryError> {
     let mut statement = connection
         .prepare("PRAGMA user_version")
         .map_err(QueryError::Prepare)?;
@@ -287,7 +287,7 @@ pub fn get_version(connection: &rusqlite::Connection) -> Result<usize, QueryErro
         .map_err(QueryError::QueryMapFailed)
 }
 
-pub fn generate_v1_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
+fn generate_v1_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
     connection
         .execute(
             "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL)",
@@ -337,7 +337,7 @@ pub fn generate_v1_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDb
     Ok(())
 }
 
-pub fn upgrade_v1_v2(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
+fn upgrade_v1_v2(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
     connection
         .execute_batch(
             "
@@ -356,7 +356,7 @@ pub fn upgrade_v1_v2(connection: &rusqlite::Connection) -> Result<(), UpgradeDbE
         .map_err(UpgradeDbError::UpgradeV1ToV2)
 }
 
-pub fn upgrade_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
+fn upgrade_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDbError> {
     let current_version = get_version(connection).map_err(UpgradeDbError::GetVersion)?;
     let upgrade_fns = [generate_v1_db, upgrade_v1_v2];
 
@@ -369,6 +369,25 @@ pub fn upgrade_db(connection: &rusqlite::Connection) -> Result<(), UpgradeDbErro
     const EXPECTED_VERSION: usize = 2;
     assert_eq!(updated_version, EXPECTED_VERSION);
     Ok(())
+}
+
+/// Returns insertion row id
+fn add_condition_set(transaction: &Connection, name: &str, conditions: &[Condition]) -> Result<i64, AddFilterError> {
+    transaction
+        .execute("INSERT INTO condition_sets(name) VALUES (?1)", [name])
+        .map_err(AddFilterError::InsertFilter)?;
+
+    let condition_set_id = transaction.last_insert_rowid();
+
+    for condition in conditions {
+        match condition {
+            Condition::NoRelationship(side, relationship_id) => {
+                transaction.execute("INSERT INTO no_relationship_conditions(condition_id, side, relationship_id) VALUES (?1, ?2, ?3)", [condition_set_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
+            }
+        }
+    }
+
+    Ok(condition_set_id)
 }
 
 #[derive(Debug)]
@@ -585,7 +604,7 @@ impl Db {
         &self.item_path
     }
 
-    pub fn add_filter(
+    pub fn add_root_filter(
         &mut self,
         name: &str,
         conditions: &[Condition],
@@ -595,11 +614,7 @@ impl Db {
             .transaction()
             .map_err(AddFilterError::StartTransaction)?;
 
-        transaction
-            .execute("INSERT INTO condition_sets(name) VALUES (?1)", [name])
-            .map_err(AddFilterError::InsertFilter)?;
-
-        let inserted_condition_set = transaction.last_insert_rowid();
+        let inserted_condition_set = add_condition_set(&transaction, name, conditions)?;
 
         transaction
             .execute(
@@ -607,16 +622,6 @@ impl Db {
                 [inserted_condition_set],
             )
             .map_err(AddFilterError::InsertRootFilter)?;
-
-        let filter_id = transaction.last_insert_rowid();
-
-        for condition in conditions {
-            match condition {
-                Condition::NoRelationship(side, relationship_id) => {
-                    transaction.execute("INSERT INTO no_relationship_conditions(condition_id, side, relationship_id) VALUES (?1, ?2, ?3)", [filter_id, side.as_i64(), relationship_id.0]).map_err(AddFilterError::InsertRule)?;
-                }
-            }
-        }
 
         transaction
             .commit()
@@ -757,6 +762,30 @@ impl Db {
             .filter(|filter| root_filter_ids.contains(&filter.id))
             .collect();
         Ok(ret)
+    }
+
+    pub fn add_item_filter(&mut self, name: &str, conditions: &[Condition], filters: &[Condition]) -> Result<(), AddFilterError> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(AddFilterError::StartTransaction)?;
+
+        // FIXME: Unique error types
+        let condition_id = add_condition_set(&transaction, name, conditions)?;
+        let filter_id = add_condition_set(&transaction, name, filters)?;
+
+        transaction
+            .execute(
+                "INSERT INTO item_filters(condition, filter) VALUES (?1, ?2)",
+                [condition_id, filter_id],
+            )
+            .map_err(AddFilterError::InsertRootFilter)?;
+
+        transaction
+            .commit()
+            .map_err(AddFilterError::CommitTransaction)?;
+
+        Ok(())
     }
 
     pub fn get_item_filters(&mut self) -> Result<Vec<ItemFilter>, GetConditionalFiltersError> {
@@ -1562,7 +1591,7 @@ mod test {
 
         fixture
             .db
-            .add_filter(
+            .add_root_filter(
                 "my_filter",
                 &[Condition::NoRelationship(
                     RelationshipSide::Dest,
@@ -1637,4 +1666,8 @@ mod test {
             .expect("failed to get parent");
         assert_eq!(parent.relationships.len(), 0);
     }
+
+
+    // FIXME: Missing add root filter test
+    // FIXME: Missing add item filter test
 }

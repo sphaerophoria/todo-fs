@@ -25,6 +25,7 @@ enum ArgParseError {
     UnknownArg(String),
 }
 
+// FIXME: Duplicated
 fn parse_filter<It: Iterator<Item = String>>(it: &mut It) -> Result<Condition, ArgParseError> {
     let filter_name = it.next().ok_or(ArgParseError::MissingFilterType)?;
     if filter_name != "no_relationship" {
@@ -44,11 +45,18 @@ fn parse_filter<It: Iterator<Item = String>>(it: &mut It) -> Result<Condition, A
     Ok(Condition::NoRelationship(side, RelationshipId(id)))
 }
 
+struct Args {
+    name: String,
+    conditions: Vec<Condition>,
+    filters: Vec<Condition>,
+}
+
 fn parse_args<It: Iterator<Item = String>>(
     mut it: It,
-) -> Result<CreateFilterRequest, ArgParseError> {
+) -> Result<Args, ArgParseError> {
     let _program_name = it.next();
 
+    let mut conditions = Vec::new();
     let mut filters = Vec::new();
     let mut name = None;
 
@@ -57,6 +65,7 @@ fn parse_args<It: Iterator<Item = String>>(
             "--name" => {
                 name = it.next();
             }
+            "--condition" => conditions.push(parse_filter(&mut it)?),
             "--filter" => filters.push(parse_filter(&mut it)?),
             "--help" => {
                 help();
@@ -67,19 +76,24 @@ fn parse_args<It: Iterator<Item = String>>(
 
     let name = name.ok_or(ArgParseError::MissingFilterName)?;
 
-    Ok(CreateFilterRequest { name, filters })
+    Ok(Args {
+        name,
+        conditions,
+        filters,
+    })
 }
 
 fn help() -> ! {
     let program_name = std::env::args()
         .next()
-        .unwrap_or("create-filter".to_string());
+        .unwrap_or("create-root-filter".to_string());
     println!(
         "\
              Usage: {} [args]\n\
              \n\
              --name: Name for filter\n\
              --filter: Can be passed multiple times to combine filters (in order)\n\
+             --condition: Can be passed multiple times to combine conditions (in order)\n\
              \n\
              Filter options:\n\
              no_relationship [side] [relationship_id]\n\
@@ -93,13 +107,15 @@ fn help() -> ! {
 }
 
 fn main() {
-    let filter = match parse_args(std::env::args()) {
+    let args = match parse_args(std::env::args()) {
         Ok(v) => v,
         Err(e) => {
             println!("{e}");
             help();
         }
     };
-    let request = ClientRequest::CreateFilter(filter);
-    api::send_client_request(&request);
+    let mut db = todo_fs::db::Db::new("test_db".into()).expect("failed to open db");
+    db.add_item_filter(&args.name, &args.conditions, &args.filters).expect("failed to insert item filters");
+    //let request = ClientRequest::CreateFilter(filter);
+    //api::send_client_request(&request);
 }
